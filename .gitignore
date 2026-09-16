@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# Environment / secrets
+.env
+.env.local
+*.local
+
+# RAG vector store (재생성 가능)
+chroma_db/
+
+# 런타임 상태 (실행 중 생성되는 로컬 데이터)
+data/ledger.json
+data/price_cache.json
+
+# IDE
+.vscode/
+.idea/
+
+# Testing
+.pytest_cache/

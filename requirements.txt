@@ -1,0 +1,25 @@
+# ── 과정 공통 스택 (Amazon Bedrock) ────────────────────────
+langchain>=0.3
+langchain-text-splitters>=0.3
+langchain-core>=0.3
+langchain-aws>=0.2
+langgraph>=0.2
+python-dotenv>=1.0
+pydantic>=2.7
+
+# ── RAG ────────────────────────────────────────────────────
+chromadb>=0.5
+langchain-chroma>=0.1
+kiwipiepy>=0.17
+
+# ── API 서버 ─────────────────────────────────────────────────
+fastapi>=0.115
+uvicorn[standard]>=0.32
+requests>=2.31
+
+# ── 평가 (RAGAS) ───────────────────────────────────────────
+# ragas>=0.4는 scikit-network가 필수 의존성인데 Python 3.14용 사전빌드 wheel이 없어
+# 소스 빌드(Visual C++ 빌드 도구 필요)로 떨어진다. 0.3.0은 이 의존성이 없어 그대로 설치된다
+# (evaluation/_ragas_compat.py가 langchain-community 최신판과의 자잘한 호환성만 보정).
+ragas==0.3.0
+pillow>=10.4

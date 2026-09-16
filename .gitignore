@@ -18,6 +18,8 @@ chroma_db/
 # 런타임 상태 (실행 중 생성되는 로컬 데이터)
 data/ledger.json
 data/price_cache.json
+data/price_history.json
+data/month_state.json
 
 # IDE
 .vscode/

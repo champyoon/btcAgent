@@ -47,7 +47,8 @@ import tools as domain_tools
 from price_history import KST
 from datetime import datetime
 
-MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"  # 쿼터 여유로 임시 전환 — 원복하려면 sonnet-4-5로
+# 이 계정에서 실제로 쓸 수 있는 다른 모델 목록·바꾸는 이유는 CLAUDE.md "모델 교체" 절 참고.
 REGION = "us-east-1"
 MAX_STEPS = 4  # Day3의 MAX_TOOL_CALLS와 같은 취지 — 순환이 무한히 돌지 않게
 
@@ -502,7 +503,11 @@ def _build_worker_graph(agent_name: str, llm):
     system_prompt = _AGENT_SYSTEM_PROMPTS[agent_name]
 
     def agent_node(state: WorkerState) -> dict:
-        messages = [SystemMessage(content=system_prompt)] + state["messages"]
+        # "오늘"/"어제" 같은 상대적 날짜 표현을 실제 날짜로 옮기려면 LLM이 지금이 언제인지 알아야
+        # 한다 — 실사용 중 "오늘 매수했어"에서 executed_date를 못 채우는 실패가 실제로 발견됨.
+        today_str = datetime.now(KST).strftime("%Y-%m-%d(%a)")
+        dated_prompt = f"{system_prompt}\n\n오늘 날짜는 {today_str}입니다(KST 기준). 상대적 날짜 표현(오늘/어제/이번 달 등)은 이 날짜를 기준으로 실제 날짜(YYYY-MM-DD)로 변환해 도구 인자에 채우세요."
+        messages = [SystemMessage(content=dated_prompt)] + state["messages"]
         response = llm_with_tools.invoke(messages)
         return {"messages": [response], "steps": state["steps"] + 1}
 

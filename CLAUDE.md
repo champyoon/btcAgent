@@ -7,7 +7,36 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A FastAPI service — **BTC DCA Agent** — that helps a single user run a monthly-budget BTC DCA plan:
 compare three purchase strategies (decline-day / biweekly / RSI) against a 48-month backtest, track
 real (self-reported) buy/watch records and remaining budget, and answer questions via a LangGraph
-multi-agent Supervisor backed by Amazon Bedrock (Claude, `us.anthropic.claude-sonnet-4-5-20250929-v1:0`).
+multi-agent Supervisor backed by Amazon Bedrock (Claude). **`src/agent.py:MODEL_ID` is currently set to
+`us.anthropic.claude-haiku-4-5-20251001-v1:0`**, temporarily swapped from
+`us.anthropic.claude-sonnet-4-5-20250929-v1:0` because that model's daily Bedrock token quota was
+exhausted on this account (see "How this was verified") — switch it back once quota/budget allows;
+nothing else needs to change to swap models. `src/retriever.py` has its own separate `MODEL_ID` constant
+for `build_rag_chain()`, but that function is currently unused (`agent.py`'s `retrieve_docs` tool calls
+`retriever.search_docs()` directly, not the RAG chain) — don't bother changing it unless that changes.
+
+## 모델 교체 (이 계정에서 실제 확인된 사용 가능 모델)
+
+`src/agent.py`의 `MODEL_ID` 상수 하나만 바꾸면 된다(위 참고). 이 AWS 계정에서 `list_inference_profiles`로
+실제 확인된 Anthropic/Amazon 모델 중 자주 쓸 만한 것들:
+
+| 모델 ID | 비고 |
+|---|---|
+| `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | 원래 기본값. 일일 추론 쿼터 소진 이력 있음(이 문서 위 참고) |
+| `us.anthropic.claude-haiku-4-5-20251001-v1:0` | **지금 사용 중** — 쿼터 여유, 실제 대화 테스트 완료 |
+| `us.anthropic.claude-sonnet-4-6` | 미검증 |
+| `us.amazon.nova-pro-v1:0` | Anthropic 계열 아님 — 도구 호출(tool-calling) 방식이 달라 `langchain_aws`
+쪽 지원 여부·프롬프트 형식 호환을 먼저 확인 필요. 미검증 |
+| `us.amazon.nova-lite-v1:0` / `us.amazon.nova-2-lite-v1:0` | 위와 동일한 이유로 미검증 |
+
+`global.` 접두사가 붙은 동일 모델(예: `global.anthropic.claude-sonnet-4-5-20250929-v1:0`)도 이 계정에서
+쓸 수 있다 — 리전 라우팅 방식만 다르고(추론 프로파일이 여러 리전에 걸쳐 라우팅될 수 있음), 나머지는
+`us.` 버전과 동일하게 다루면 된다. 쿼터가 리전별로 분리돼 있을 수도 있으니, 한쪽이 막히면 같은 모델의
+`global.` 버전도 시도해볼 만하다.
+
+**주의**: Nova 계열은 Anthropic Claude와 다른 모델 패밀리라, `ChatBedrockConverse`가 도구 호출
+스키마를 문제없이 변환해주는지 실제로 확인 안 된 상태다 — 전환 전에 최소 1회 `.invoke()` 스모크
+테스트를 거칠 것.
 
 **Read [SERVICE.md](SERVICE.md) first** (the 5-section submission-format product spec), then
 **[SPEC.md](SPEC.md)** for the full detailed design — strategy conditions, monthly flow, calculation
@@ -141,7 +170,15 @@ Key invariants to preserve when touching this code:
 
 - **Tools are partitioned per agent, never shared** (`AGENT_TOOLS` in `src/agent.py`) — if you add a
   tool, decide which single agent owns it and add it to `guardrails.RISK_LEVELS` (unregistered tools
-  default to requiring approval, "unknown things are blocked"). See also `_AGENT_KEYWORDS` for routing.
+  default to requiring approval, "unknown things are blocked"). See also `_AGENT_KEYWORDS` for routing
+  — keyword overlaps (e.g. "얼마"/"rsi"/"전략" matching multiple agents) are an accepted tradeoff of
+  Day6's deterministic-keyword design, not a bug to "fix" by removing keywords — doing so risks breaking
+  legitimate matches (e.g. removing "얼마" from `price_agent` would break "지금 얼마야?").
+- **`agent_node` appends today's KST date to every worker's system prompt at call time** (not baked into
+  `_AGENT_SYSTEM_PROMPTS`, which are static strings) — found necessary via live testing: without it, the
+  LLM has no way to resolve "오늘"/"어제" into an actual `YYYY-MM-DD` for tools like
+  `record_virtual_buy(executed_date=...)`, and silently omits the field instead of guessing. Don't move
+  this back into the static prompt strings; it must be computed fresh per call.
 - **`select_strategy` is registered as `"read"` in `RISK_LEVELS` on purpose** — it does *not* go through
   `approvals.py`. Its own propose/confirm token flow (`month_state.py`) is the real gate. Don't "fix" this
   by moving it to `"write"` — that would run it through *both* gates redundantly and is explicitly the
@@ -188,15 +225,43 @@ search for "RSI가 뭐고 어떻게 계산해?" returned exactly 4 chunks, all c
 sign the doc-restructuring split actually improved retrieval precision vs. the old mixed-topic
 `glossary.md`); (c) the new `set_monthly_budget` tool (see below) invoked directly worked correctly.
 
-**Still blocked, not a code problem**: a full live conversation through `agent.build_supervisor()` (i.e.
-actual Claude tool-calling, not just `.invoke()`) hit `ThrottlingException: Too many tokens per day` on
-the very first attempt — this AWS account's daily Bedrock **inference** token quota (separate from the
-embeddings quota, which is unaffected — see (b)) was already exhausted, most likely from earlier
-round-1/round-2 testing (SERVICE.md's trial-and-error notes already flagged this exact recurring
-constraint). This blocks: verifying the LLM actually picks the right tools in conversation, multi-turn
-confirmation UX (approval/reject, `select_strategy`'s token flow) in a real dialogue, and running
-`evaluation/run_eval.py`/RAGAS against the live server. Retry once the daily quota resets (or a quota
-increase is granted) — nothing code-side needs to change for this specifically.
+**Full live conversation — now actually verified (after switching to Haiku, see above)**: a real
+multi-turn round trip through `agent.build_supervisor()` (genuine Claude tool-calling, not `.invoke()`)
+was confirmed end to end: "오늘 매수 기록 남겨줘, 100만원/1억원" → `ledger_agent` correctly called
+`record_virtual_buy` with `executed_date` resolved to the real current date → `approvals_needed` carried
+a real `approval_id` → `execute_approved_action()` created the record → a follow-up "매수 기록 보여줘"
+correctly listed it back via `search_ledger`. RAG (`retrieve_docs`) and `plan_agent` (`get_month_status`
+correctly reporting "plan not started" for a not-yet-active month) were also confirmed live.
+
+**Bug found and fixed during this pass**: the first live attempt at the buy-recording flow above failed
+at execution — the LLM called `record_virtual_buy` *without* `executed_date`, because "오늘" ("today")
+meant nothing to it; nothing in the system prompt said what today's date is. Fixed in `agent_node`
+(`_build_worker_graph`): the system prompt now gets `오늘 날짜는 YYYY-MM-DD(요일)입니다` appended at
+call time (`datetime.now(KST)`), with an instruction to resolve relative dates against it. Retested with
+the same phrasing afterward — `executed_date` was correctly filled and the record was created. This is
+the kind of bug that only a real conversation (not `.invoke()`) can surface, since `.invoke()` tests
+supply args directly and never exercise the LLM's own date reasoning.
+
+**Two rough edges observed, not fixed (recorded, not acted on without a call on priority)**:
+1. **Keyword-routing noise**: generic keywords shared across `_AGENT_KEYWORDS` (e.g. "얼마" for
+   price_agent, matched by budget questions like "예산 얼마 남았어?"; "rsi"/"전략" matched by
+   `plan_agent`-only requests like "전략을 RSI로 바꿔줘") cause 2-3 agents to fire for a single-intent
+   question. The non-matching agents politely decline ("that's not my department") rather than answering
+   wrong, so it's not incorrect — but it pads the combined answer with filler. This is the same
+   accepted multi-match tradeoff the Day6 routing design already documents (e.g. "RSI" deliberately
+   shared between `price_agent`/`research_agent`), just showing up in a few more places than expected.
+   Fixing it well would need smarter-than-keyword routing, which is a bigger change than a quick patch.
+2. **Rate limiting is a separate axis from the daily token quota**: firing several real conversation
+   turns in quick succession hit `ThrottlingException: Too many requests` (a request-rate limit),
+   distinct from the earlier `Too many tokens per day` (daily quota). Space out live test calls;
+   retrying immediately into a request-rate throttle just extends the wait.
+
+**Still not live-tested**: `select_strategy`'s propose→confirm flow across two conversational turns —
+attempted, but ran into the request-rate limit above before completing. Its `.invoke()`-level logic
+(direct tool calls, bypassing the LLM) was already verified during wiring (see the Phase 5 agent.py
+work), so the mechanism itself is exercised — what's unverified is specifically whether the LLM naturally
+completes the two-step confirm dance in real dialogue. Also still open: `evaluation/run_eval.py`/RAGAS
+against the live server (needs the CSV/expected_tools re-authoring in SPEC §14 item 14 regardless).
 
 **Gap found and fixed during this live-testing pass**: SPEC §2-0 ("최초 이용" — set a monthly budget to
 start the plan) had no corresponding tool — `get_month_status`/`select_strategy` existed but nothing

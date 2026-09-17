@@ -215,8 +215,16 @@ _EXECUTE_STEMS = ["매수", "매도", "삭제", "초기화", "청산", "실행",
 # 어간만 bare로 매칭하면 "매수해도 되나요?"(허가를 구하는 정상 질문)까지 걸립니다("해"만 보면
 # "매수해"와 "매수해도"를 구분 못 함 — Day5의 _IMPERATIVE_ENDING_PATTERN과 동일한 교훈). 그래서
 # 명령형 어미로 완결된 형태만 실행 요청으로 인정합니다.
+# "지우다"는 "하다" 활용이 아니라 불규칙 활용(지우+어 -> 지워)이라 위 어간+"해" 패턴에 안 걸린다.
+# "삭제"의 실제 구어체 동의어라("승인 없이 그냥 지워줘") 실사용 중 이 형태만 승인 우회 차단을
+# 빠져나가는 게 확인돼(2026-09-17, evaluation/test_queries.csv #18 준비 중 발견) 별도로 등록한다.
+_IRREGULAR_EXECUTE_FORMS = [
+    "지워줘", "지워줄래", "지워주세요", "지우세요", "지워라", "지워주라", "지워다오",
+    "제거해줘", "제거해줄래", "제거해주세요", "제거하세요", "제거해라", "제거해주라", "제거해다오",
+]
 _EXECUTE_IMPERATIVE_PATTERN = re.compile(
     r"(?:" + "|".join(_EXECUTE_STEMS) + r")\s*(?:해줘|해줄래|해주세요|하세요|해라|하라|해주라|해다오|해(?!도))"
+    r"|(?:" + "|".join(re.escape(f) for f in _IRREGULAR_EXECUTE_FORMS) + r")"
 )
 
 
@@ -474,9 +482,12 @@ RISK_LEVELS: dict[str, str] = {
     "get_indicators": "read",
     "get_month_status": "read",
     "set_monthly_budget": "read",  # 사용자가 명시한 설정값 변경일 뿐 자금 이동이 없어 select_strategy와
-    # 같은 성격으로 취급한다 — 다만 이 도구는 즉시 적용된다(별도 확인 토큰 없음). 필요해지면
-    # select_strategy처럼 propose/confirm 토큰을 month_state.py에 추가해 승격할 수 있다.
+    # 같은 성격으로 취급한다 — 2026-09-18(SPEC §4-2)부터 select_strategy와 동일하게 propose/confirm
+    # 토큰(month_state._PENDING_BUDGET_CHANGES, /confirm_budget_change·/cancel_budget_change)을
+    # 거쳐야 실제로 반영된다. 이 도구도 select_strategy처럼 approvals.py의 표준 승인 게이트 대상이
+    # 아니다 — 그 확인은 아래 select_strategy 주석과 같은 이유로 이미 서버에서 별도로 검증한다.
     "run_backtest": "read",
+    "evaluate_current_condition": "read",  # §5 놓친 신호 재계산 — 조회일 뿐 상태를 바꾸지 않는다
     "retrieve_docs": "read",
     "search_ledger": "read",
     "record_watch_decision": "read",  # SPEC §2-2: 자금 이동 없는 결정이라 승인 불필요
@@ -514,6 +525,14 @@ def needs_approval(tool_name: str, args: dict) -> tuple[bool, str]:
     if level == "read":
         return False, "조회성 도구는 승인 없이 자동 실행됩니다."
     if level == "write":
+        # amend/cancel은 "장부 정정이지 실제 거래 취소가 아니다"라는 점이 승인 전 안내에도 있어야
+        # 한다는 게 평가 중 확인됐다(2026-09-17, evaluation #16) — 실행 후 결과 메시지에는 이미
+        # 있었지만, 승인 대기 중에 보여줄 reason에는 없어서 사용자가 승인 전 그 사실을 모를 수 있었다.
+        if tool_name in ("amend_virtual_buy", "cancel_virtual_buy"):
+            return True, (
+                f"'{tool_name}'은(는) 상태를 변경하는 동작이라 승인이 필요합니다 "
+                "(장부 정정이며, 실제 거래를 취소하는 것이 아닙니다)."
+            )
         return True, f"'{tool_name}'은(는) 상태를 변경하는 동작이라 승인이 필요합니다."
     if level == "destructive":
         return True, f"'{tool_name}'은(는) 되돌릴 수 없는 동작이라 승인 + 이중(double) 확인이 필요합니다."

@@ -6,6 +6,10 @@
                  {"answer", "contexts", "trace", ...}
   POST /approve  대기 중인 승인을 실행 {"approval_id": str} — SPEC §10-1
   POST /reject   대기 중인 승인을 거절 {"approval_id": str} — SPEC §10-1
+  POST /confirm_strategy_change  select_strategy가 제안한 전략 변경을 적용 {"confirmation_token": str}
+  POST /cancel_strategy_change   select_strategy가 제안한 전략 변경을 취소 {"confirmation_token": str}
+  POST /confirm_budget_change    set_monthly_budget이 제안한 예산 설정/변경을 적용 {"confirmation_token": str}
+  POST /cancel_budget_change     set_monthly_budget이 제안한 예산 설정/변경을 취소 {"confirmation_token": str}
 
 실행:
   python app.py
@@ -74,6 +78,14 @@ class RejectRequest(BaseModel):
     approval_id: str
 
 
+class StrategyConfirmationRequest(BaseModel):
+    confirmation_token: str
+
+
+class BudgetConfirmationRequest(BaseModel):
+    confirmation_token: str
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -91,6 +103,17 @@ def query(req: QueryRequest) -> dict:
     data_gap_needs_confirmation이 채워져 있으면(SPEC §7-1), 최신 확정 일봉이 아직 없어 계산을
     멈춘 상태입니다. 그래도 진행하려면 같은 question으로 proceed_with_stale_data=true를 실어
     재요청하세요.
+
+    strategy_change_needs_confirmation이 채워져 있으면 select_strategy가 전략 변경을 제안한
+    상태입니다. 이 API는 대화 기록이 없는 무상태라 "네 확인했어요" 같은 자연어 재질문은 라우팅조차
+    안 될 수 있습니다 — 반드시 그 안의 confirmation_token을 /confirm_strategy_change(적용) 또는
+    /cancel_strategy_change(취소)로 구조화해서 보내세요.
+
+    budget_change_needs_confirmation이 채워져 있으면 set_monthly_budget이 예산 설정/변경을 제안한
+    상태입니다(SPEC §4-2, 2026-09-18 확정 — 이전엔 즉시 반영이었습니다). 같은 이유로 반드시 그 안의
+    confirmation_token을 /confirm_budget_change(적용) 또는 /cancel_budget_change(취소)로
+    구조화해서 보내세요 — 이 요청들은 금액·적용월을 함께 보내지 않습니다(서버가 제안 시점에 저장해둔
+    값만 씁니다).
 
     Bedrock 호출이 실패해도(쿼터 초과 등) 500을 그대로 노출하지 않고, §4-2 계약 형태를 유지한 채
     사유를 안내합니다 (`error` 필드는 계약 밖 부가 정보).
@@ -123,6 +146,57 @@ def approve(req: ApproveRequest) -> dict:
 def reject(req: RejectRequest) -> dict:
     """대기 중인 승인을 approval_id만으로 거절합니다(SPEC §10-1). 도메인 도구는 실행되지 않습니다."""
     result = agent.reject_approved_action(req.approval_id)
+    status = result.pop("http_status")
+    if status == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    if status == 409:
+        raise HTTPException(status_code=409, detail=result["error"])
+    return result
+
+
+@app.post("/confirm_strategy_change")
+def confirm_strategy_change(req: StrategyConfirmationRequest) -> dict:
+    """select_strategy가 제안한 전략 변경을 confirmation_token만으로 적용합니다. LLM/라우팅을
+    거치지 않습니다 — approvals_needed/{/approve}와 같은 이유로, 이 API는 대화 기록이 없어 자연어
+    확인만으로는 이 토큰을 다시 실어 보낼 방법이 없기 때문입니다."""
+    result = agent.confirm_strategy_change_action(req.confirmation_token)
+    status = result.pop("http_status")
+    if status == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
+@app.post("/cancel_strategy_change")
+def cancel_strategy_change(req: StrategyConfirmationRequest) -> dict:
+    """select_strategy가 제안한 전략 변경을 confirmation_token만으로 취소합니다. 아무것도
+    적용되지 않습니다."""
+    result = agent.cancel_strategy_change_action(req.confirmation_token)
+    status = result.pop("http_status")
+    if status == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
+@app.post("/confirm_budget_change")
+def confirm_budget_change(req: BudgetConfirmationRequest) -> dict:
+    """set_monthly_budget이 제안한 예산 설정/변경을 confirmation_token만으로 적용합니다(SPEC §4-2,
+    2026-09-18 확정). 클라이언트가 금액·적용월을 보내도 받지 않습니다 — 서버가 제안 시점에 저장해둔
+    값만 씁니다. 존재하지 않는 토큰은 404, 이미 확인·취소로 소진됐거나 제안 이후 상태·시점이 달라져
+    낡은 제안이 된 경우는 409입니다(다시 제안해야 합니다)."""
+    result = agent.confirm_budget_change_action(req.confirmation_token)
+    status = result.pop("http_status")
+    if status == 404:
+        raise HTTPException(status_code=404, detail=result["error"])
+    if status == 409:
+        raise HTTPException(status_code=409, detail=result["error"])
+    return result
+
+
+@app.post("/cancel_budget_change")
+def cancel_budget_change(req: BudgetConfirmationRequest) -> dict:
+    """set_monthly_budget이 제안한 예산 설정/변경을 confirmation_token만으로 취소합니다. 아무것도
+    적용되지 않습니다. 존재하지 않는 토큰은 404, 이미 처리된 토큰은 409입니다."""
+    result = agent.cancel_budget_change_action(req.confirmation_token)
     status = result.pop("http_status")
     if status == 404:
         raise HTTPException(status_code=404, detail=result["error"])

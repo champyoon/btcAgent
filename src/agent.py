@@ -47,7 +47,7 @@ import tools as domain_tools
 from price_history import KST
 from datetime import datetime
 
-MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"  # 쿼터 여유로 임시 전환 — 원복하려면 sonnet-4-5로
+MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"  # 2026-09-17: 4개 후보(haiku-4-5/sonnet-4-6/nova-pro/nova-lite) 동일 질문 비교 후 확정 채택. 근거는 evaluation/model_comparison_report.md, CLAUDE.md "모델 선정" 참고 — 임시 대체가 아니라 최종 선택.
 # 이 계정에서 실제로 쓸 수 있는 다른 모델 목록·바꾸는 이유는 CLAUDE.md "모델 교체" 절 참고.
 REGION = "us-east-1"
 MAX_STEPS = 4  # Day3의 MAX_TOOL_CALLS와 같은 취지 — 순환이 무한히 돌지 않게
@@ -67,6 +67,15 @@ def _default_llm():
 
 _REQUEST_CONTEXT: dict[str, Any] = {"proceed_with_stale_data": False}
 _LAST_DATA_GAP: dict | None = None
+# select_strategy의 제안(confirmation_token 발급)을 API 응답에 실어 보내기 위한 요청 스코프 상태.
+# 실사용 중 발견: 이 API는 대화 기록이 없는 완전 무상태라, 사용자가 "응 확인했어"처럼 키워드 없는
+# 말로 답하면 route_question이 아무 Agent에도 안 걸려 그 토큰을 다시 실어 보낼 방법이 없었다
+# (approvals_needed/approval_id는 /approve라는 별도의, 대화·라우팅을 안 거치는 구조화 경로가 있어
+# 이 문제가 없다 — 그래서 select_strategy 확인도 같은 모양의 전용 엔드포인트를 추가한다).
+_LAST_STRATEGY_PROPOSAL: dict | None = None
+# set_monthly_budget의 제안(confirmation_token 발급)을 API 응답에 실어 보내기 위한 요청 스코프
+# 상태 — _LAST_STRATEGY_PROPOSAL과 완전히 같은 이유(SPEC §4-2, 2026-09-18 기획 변경)로 존재한다.
+_LAST_BUDGET_PROPOSAL: dict | None = None
 _LAST_RETRIEVED_DOCS: list = []
 
 
@@ -103,18 +112,58 @@ def get_btc_price() -> str:
     return domain_tools.get_btc_price()
 
 
-@tool
-def get_indicators() -> str:
-    """RSI(14, RMA)·200일 이동평균 괴리율·기간별(1개월/1년/4년) 드로다운의 값과 의미를 설명합니다.
-    종합 매수 등급은 만들지 않습니다 — 매수 조건 판정은 select_strategy로 고른 전략이 따로 봅니다."""
-    price_history.update_incremental()
-    gate_msg = _freshness_gate_message()
-    if gate_msg:
-        return gate_msg
+def _required_range_gap_message(records: list[dict]) -> str | None:
+    """확정 레코드가 실제로 쓰이는 전체 구간(records[0]~records[-1])에 결측이 없는지 확인한다.
 
-    records = price_history.confirmed_records()
+    실사용/평가 중 발견(2026-09-18): "레코드 개수 >= 200"만 확인하면, 그 200개(또는 그 이상)가
+    실제로는 연속된 날짜가 아니라 중간에 구멍이 뚫린 채로도 개수 조건만 맞으면 통과해버린다. RSI는
+    누적 RMA라 어느 지점에 결측이 있든 그 뒤의 모든 계산이 "인접하지 않은 두 날"을 인접한 것처럼
+    다루게 되고, MA200도 최근 200개 슬라이스가 실제로 연속 200일인지는 보지 않는다. 이 검사는
+    `proceed_with_stale_data`(§7-1, "최신 일봉이 아직 없다")와는 완전히 별개다 — 그 플래그는 최신
+    쪽 지연만 눈감아주는 것이지, 과거 구간 중간의 결측까지 우회하게 해서는 안 된다(그래서 이 함수는
+    _REQUEST_CONTEXT를 전혀 참조하지 않는다).
+    """
+    if not records:
+        return None
+    missing = price_history.find_missing_dates(records, records[0]["date_kst"], records[-1]["date_kst"])
+    if not missing:
+        return None
+    sample = ", ".join(missing[:3]) + (" 등" if len(missing) > 3 else "")
+    return (
+        f"계산에 필요한 구간({records[0]['date_kst']}~{records[-1]['date_kst']})에 결측 일봉이 "
+        f"{len(missing)}건 있어 계산할 수 없습니다({sample}). proceed_with_stale_data로도 우회되지 "
+        "않습니다 — 데이터 정합성을 먼저 복구해야 합니다."
+    )
+
+
+def _rsi_desc(v: float | None) -> str:
+    if v is None:
+        return "계산 불가"
+    if v > 70:
+        return f"{v:.2f} (과매수 구간)"
+    if v < 30:
+        return f"{v:.2f} (과매도 구간)"
+    return f"{v:.2f} (중립 구간)"
+
+
+def _dd_desc(d: dict | None) -> str:
+    if d is None:
+        return "계산 불가(구간 내 데이터 부족)"
+    return f"{d['pct']:.2f}%({d['start_date']}~{d['end_date']} 고점 {d['high']:,.0f}원 대비)"
+
+
+def _indicators_summary(records: list[dict]) -> str:
+    """records(확정 일봉, 과거->최신)로부터 RSI·MA200 괴리율·드로다운 요약 문자열을 만든다.
+
+    `get_indicators` 도구의 순수 로직 부분만 떼어낸 함수 — 네트워크(update_incremental) 없이
+    고정 레코드로 직접 테스트하기 위해 분리했다(결측 구간 회귀 테스트가 이 함수를 직접 부른다).
+    """
     if len(records) < 200:
         return "지표 계산에 필요한 데이터가 아직 부족합니다(최소 200일 확정 일봉 필요)."
+
+    gap_msg = _required_range_gap_message(records)
+    if gap_msg:
+        return gap_msg
 
     closes = [r["close"] for r in records]
     rsi_series = indicators.compute_rsi_series(closes)
@@ -123,20 +172,6 @@ def get_indicators() -> str:
     dd_1m = indicators.compute_drawdown(records, days=30)
     dd_1y = indicators.compute_drawdown(records, days=365)
     dd_4y = indicators.compute_drawdown(records, months=48)
-
-    def _rsi_desc(v: float | None) -> str:
-        if v is None:
-            return "계산 불가"
-        if v > 70:
-            return f"{v:.2f} (과매수 구간)"
-        if v < 30:
-            return f"{v:.2f} (과매도 구간)"
-        return f"{v:.2f} (중립 구간)"
-
-    def _dd_desc(d: dict | None) -> str:
-        if d is None:
-            return "계산 불가(구간 내 데이터 부족)"
-        return f"{d['pct']:.2f}%({d['start_date']}~{d['end_date']} 고점 {d['high']:,.0f}원 대비)"
 
     ma_desc = "계산 불가" if ma_dev is None else f"{ma_dev:.2f}%({'저평가 방향' if ma_dev < 0 else '고평가 방향'})"
 
@@ -149,18 +184,44 @@ def get_indicators() -> str:
 
 
 @tool
+def get_indicators() -> str:
+    """RSI(14, RMA)·200일 이동평균 괴리율·기간별(1개월/1년/4년) 드로다운의 값과 의미를 설명합니다.
+    종합 매수 등급은 만들지 않습니다 — 매수 조건 판정은 select_strategy로 고른 전략이 따로 봅니다."""
+    price_history.update_incremental()
+    gate_msg = _freshness_gate_message()
+    if gate_msg:
+        return gate_msg
+
+    records = price_history.confirmed_records()
+    return _indicators_summary(records)
+
+
+@tool
 def get_month_status(year: int = 0, month: int = 0) -> str:
     """이번 달(연·월을 지정하지 않으면 오늘 기준)의 예산·선택 전략·남은 예산·전략 변경 가능 여부를
-    조회합니다."""
+    조회합니다. '조회 대상 월'과 '계획 시작월'은 서로 다른 개념입니다 — 조회 대상 월이 계획
+    시작월보다 이르면 그 달은 계획 시작 전이지만, 계획 자체나 다른 달의 전략 선택 여부와는
+    무관합니다. 응답에 항상 두 값을 구분해서 표시합니다."""
     now = datetime.now(KST)
     year = year or now.year
     month = month or now.month
     status = month_state.get_month_status(year, month, now=now)
+    start_month = status.get("plan_start_month")
+    header = f"[조회 대상 {year}-{month:02d}]"
 
     if not status["plan_started"]:
-        return f"{year}-{month:02d}은(는) 아직 계획이 시작되지 않았습니다(월중 가입 시 다음 달부터 시작)."
+        if start_month:
+            start_info = f"계획 시작월은 {start_month}입니다 — 그 달부터 예산 집행·전략 선택이 시작됩니다."
+        else:
+            start_info = "아직 어떤 계획도 시작하지 않았습니다(set_monthly_budget으로 시작할 수 있습니다)."
+        return (
+            f"{header} 이 달은 계획 시작 전이라 예산·전략 상태가 없습니다. {start_info} "
+            "(이 달 이후 다른 달의 계획 시작 여부·전략 선택 여부와는 별개입니다.)"
+        )
 
-    lines = [f"{year}-{month:02d} 계획 상태 — 월 예산 {status['monthly_budget_krw']:,.0f}원"]
+    lines = [f"{header} 계획 상태 — 월 예산 {status['monthly_budget_krw']:,.0f}원"]
+    if start_month:
+        lines.append(f"계획 시작월: {start_month}")
     if "spent_krw" in status:
         over = " (예산 초과 — 추가 매수는 권하지 않습니다)" if status["over_budget"] else ""
         lines.append(f"사용액 {status['spent_krw']:,.0f}원, 남은 예산 {status['remaining_krw']:,.0f}원{over}")
@@ -176,31 +237,43 @@ def get_month_status(year: int = 0, month: int = 0) -> str:
 
 @tool
 def set_monthly_budget(amount_krw: float) -> str:
-    """월 투자 예산을 설정합니다. 아직 계획을 시작한 적이 없다면 이 호출로 계획이 시작됩니다
-    (오늘이 1일이면 이번 달부터, 아니면 다음 달부터 — SPEC §2-0). 이미 계획이 있다면 예산 변경으로
-    처리되며, 항상 다음 달부터 적용됩니다(이번 달 예산은 그대로 유지)."""
-    state = month_state.load_state()
-    if not state.get("plan_start_month"):
-        result = month_state.init_plan(amount_krw)
-        if not result["ok"]:
-            return f"설정 실패: {result['error']}"
-        return f"월 예산 {amount_krw:,.0f}원으로 계획을 시작합니다 — {result['plan_start_month']}부터 적용됩니다."
-
-    result = month_state.set_monthly_budget(amount_krw)
-    if not result["ok"]:
-        return f"설정 실패: {result['error']}"
+    """월 투자 예산을 설정/변경하는 안을 제안합니다(SPEC §4-2, 2026-09-18 확정 — 이 호출만으로는
+    아직 반영되지 않습니다). 아직 계획을 시작한 적이 없다면 최초 설정 안(오늘이 1일이면 이번 달부터,
+    아니면 다음 달부터 — SPEC §2-0)을, 이미 계획이 있다면 변경 안(항상 다음 달부터 적용, 이번 달
+    예산은 유지)을 만듭니다. 사용자가 동의하면 이 응답의
+    budget_change_needs_confirmation.confirmation_token을 POST /confirm_budget_change 로 보내야
+    실제로 저장됩니다(POST /cancel_budget_change 로 취소 가능). 실제 설정/변경 지시일 때만
+    호출하세요 — 예시·계산 목적의 질문에는 호출하지 말고 말로 설명하세요."""
+    global _LAST_BUDGET_PROPOSAL
+    now = datetime.now(KST)
+    proposal = month_state.propose_budget_change(amount_krw, now=now)
+    if not proposal["ok"]:
+        return f"제안 실패: {proposal['error']}"
+    _LAST_BUDGET_PROPOSAL = {
+        "confirmation_token": proposal["confirmation_token"],
+        "amount_krw": proposal["amount_krw"],
+        "effective_month": proposal["effective_month"],
+        "is_initial": proposal["is_initial"],
+    }
+    verb = "시작" if proposal["is_initial"] else "변경"
     return (
-        f"월 예산을 {amount_krw:,.0f}원으로 변경합니다 — {result['effective_month']}부터 적용됩니다"
-        "(이번 달은 기존 예산이 그대로 유지됩니다)."
+        f"월 예산을 {amount_krw:,.0f}원으로 {verb}하는 안입니다 — {proposal['effective_month']}부터 "
+        "적용됩니다. 사용자가 동의하면 이 응답의 budget_change_needs_confirmation.confirmation_token을 "
+        "POST /confirm_budget_change 로 보내 적용하세요(POST /cancel_budget_change 로 취소 가능)."
     )
 
 
 @tool
 def select_strategy(strategy: str, year: int = 0, month: int = 0, confirmation_token: str = "") -> str:
-    """이번 달 남은 예산에 적용할 전략을 선택/변경합니다. strategy는 decline_day(하락일)/
-    biweekly(정기 분할)/rsi(RSI 매수) 중 하나입니다. 처음 호출하면 적용되지 않고 확인 절차만
-    시작됩니다 — 사용자에게 변경 내용을 확인받은 뒤, 같은 인자에 confirmation_token을 채워
-    다시 호출해야 실제로 적용됩니다(서버가 토큰으로 검증합니다)."""
+    """이번 달 남은 예산에 적용할 전략을 선택/변경합니다. strategy는 decline_day(하락일 매수)/
+    biweekly(정기 분할 — 매월 1일과 15일, 두 번 매수. "2주 간격"이 아니라 이 두 날짜를 뜻하는
+    내부 식별자일 뿐입니다)/rsi(RSI 매수) 중 하나입니다. 처음 호출하면 적용되지 않고 확인 절차만
+    시작됩니다 — 실제 적용은 사용자가 POST /confirm_strategy_change로 확인해야 이뤄집니다(아직
+    채팅 UI가 없으므로 '버튼을 누르라'는 식으로 안내하지 마세요 — 이 API 경로만 존재합니다). 이
+    도구에 confirmation_token을 직접 다시 채워 호출하는 경로도 있지만(같은 대화 안에서 LLM이
+    토큰을 계속 기억하고 있을 때만 동작), 이 API는 대화 기록이 없는 무상태라 일반적으로는 전용
+    엔드포인트 쪽이 실제로 쓰이는 경로입니다."""
+    global _LAST_STRATEGY_PROPOSAL
     now = datetime.now(KST)
     year = year or now.year
     month = month or now.month
@@ -215,9 +288,16 @@ def select_strategy(strategy: str, year: int = 0, month: int = 0, confirmation_t
     proposal = month_state.propose_strategy_change(year, month, strategy, now=now)
     if not proposal["ok"]:
         return f"변경 불가: {proposal['error']}"
+    _LAST_STRATEGY_PROPOSAL = {
+        "confirmation_token": proposal["confirmation_token"],
+        "year": year,
+        "month": month,
+        "strategy": strategy,
+    }
     return (
-        f"{year}-{month:02d} 전략을 '{strategy}'(으)로 변경하는 안입니다. 사용자에게 확인받은 뒤, "
-        f"confirmation_token='{proposal['confirmation_token']}'로 이 도구를 다시 호출해 적용하세요."
+        f"{year}-{month:02d} 전략을 '{strategy}'(으)로 변경하는 안입니다. 사용자가 동의하면 "
+        f"이 응답의 strategy_change_needs_confirmation.confirmation_token을 "
+        "POST /confirm_strategy_change 로 보내 적용하세요(POST /cancel_strategy_change 로 취소 가능)."
     )
 
 
@@ -250,6 +330,49 @@ def run_backtest(monthly_budget_krw: float) -> str:
 
 
 @tool
+def evaluate_current_condition() -> str:
+    """이번 달 지금까지 확정된 일봉만으로, 이번 달 선택한 전략의 매수 조건이 이미 충족된 적
+    있는지 다시 계산합니다(§5 놓친 신호 재계산). "며칠 전에 조건이 충족됐었는데 지금도 매수
+    가능한가?" 같은 질문에 씁니다. 과거에 충족된 적이 있다는 사실은 안내하되, 그러니 지금도
+    매수해도 된다는 뜻은 아닙니다 — 실제 매수 여부와 기록은 항상 사용자가 직접 정합니다."""
+    now = datetime.now(KST)
+    year, month = now.year, now.month
+    strategy = month_state.get_selected_strategy(year, month)
+    if not strategy:
+        return f"{year}-{month:02d}에 선택된 전략이 없어 조건을 판정할 수 없습니다."
+
+    price_history.update_incremental()
+    gate_msg = _freshness_gate_message()
+    if gate_msg:
+        return gate_msg
+
+    records = price_history.confirmed_records()
+    prefix = f"{year:04d}-{month:02d}"
+    days_this_month = [r for r in records if r["date_kst"].startswith(prefix)]
+    if not days_this_month:
+        return f"{year}-{month:02d} 확정된 일봉이 아직 없어 판정할 수 없습니다."
+
+    closes = [r["close"] for r in records]
+    rsi_series = indicators.compute_rsi_series(closes)
+    rsi_by_date = {records[i]["date_kst"]: rsi_series[i] for i in range(len(records))}
+    first_buy_price = ledger.first_buy_price_for_month(year, month)
+
+    result = month_state.evaluate_current_condition(
+        year, month, strategy, days_this_month, rsi_by_date, first_buy_price
+    )
+    labels = {"decline_day": "하락일 매수", "biweekly": "정기 분할", "rsi": "RSI 매수"}
+    label = labels.get(strategy, strategy)
+    if not result["triggered"]:
+        return f"{year}-{month:02d} '{label}' 조건 재계산 결과: {result.get('reason', '충족된 적이 없습니다.')}"
+    return (
+        f"{year}-{month:02d} '{label}' 조건이 {result['trigger_date']}에 충족된 것으로 계산됩니다"
+        f"(그 다음 확정 일봉 시가 매수 기준 매수일: {result.get('buy_date') or '아직 확정되지 않음'}). "
+        "과거 신호를 지금 다시 확인한 결과일 뿐이며, 지금 시점에 자동으로 매수 조건이 이어지는 건 "
+        "아닙니다 — 실제 매수는 사용자가 직접 결정해 기록해야 합니다."
+    )
+
+
+@tool
 def retrieve_docs(query: str) -> str:
     """BTC·DCA·지표·서비스 규칙 문서에서 질문과 관련된 내용을 검색합니다."""
     docs = retriever.search_docs(query)
@@ -260,11 +383,14 @@ def retrieve_docs(query: str) -> str:
 
 
 @tool
-def search_ledger() -> str:
-    """지금까지 남긴 실제 매수·관망 기록을 조회합니다."""
-    entries = ledger.search_ledger()
+def search_ledger(year: int = 0, month: int = 0) -> str:
+    """지금까지 남긴 실제 매수·관망 기록을 조회합니다. '이번 달'/'다음 달'처럼 특정 달을 콕 집어
+    물으면 반드시 year/month를 채우세요 — 비워두면 전체 기간 기록이 나와, plan_agent가 같은 질문에
+    특정 달 기준으로 답한 예산 상태와 범위가 달라 모순돼 보일 수 있습니다."""
+    entries = ledger.search_ledger(year=year, month=month)
     if not entries:
-        return "기록이 없습니다."
+        scope = f"{year}-{month:02d}" if year and month else "전체 기간"
+        return f"{scope} 기록이 없습니다."
     lines = []
     for e in entries:
         if e["type"] == "buy":
@@ -348,7 +474,10 @@ def record_watch_decision(note: str) -> str:
     price_history.update_incremental()
     records = price_history.confirmed_records()
     snapshot: dict[str, Any] = {}
-    if len(records) >= 200:
+    # 결측 구간이 있으면(get_indicators와 같은 기준 — _required_range_gap_message) 스냅샷을
+    # 비워둔다 — 개수만 맞다고 잘못된 RSI를 관망 기록에 남기지 않는다. 관망 결정 자체(note)는
+    # 그대로 기록된다(§2-2: 자금 이동 없는 결정이라 지표 계산 가능 여부와 무관하게 승인 불필요).
+    if len(records) >= 200 and _required_range_gap_message(records) is None:
         closes = [r["close"] for r in records]
         rsi_series = indicators.compute_rsi_series(closes)
         snapshot = {
@@ -369,7 +498,10 @@ def reset_ledger() -> str:
 
 AGENT_TOOLS: dict[str, list[str]] = {
     "price_agent": ["get_btc_price", "get_indicators"],
-    "plan_agent": ["get_month_status", "set_monthly_budget", "select_strategy", "run_backtest"],
+    "plan_agent": [
+        "get_month_status", "set_monthly_budget", "select_strategy", "run_backtest",
+        "evaluate_current_condition",
+    ],
     "research_agent": ["retrieve_docs"],
     "ledger_agent": [
         "search_ledger",
@@ -388,6 +520,7 @@ _ALL_TOOLS = [
     set_monthly_budget,
     select_strategy,
     run_backtest,
+    evaluate_current_condition,
     retrieve_docs,
     search_ledger,
     record_virtual_buy,
@@ -402,24 +535,130 @@ _AGENT_SYSTEM_PROMPTS = {
     "price_agent": (
         "당신은 비트코인 시세·지표 담당 Agent입니다. 시세와 지표 조회 도구만 사용해 사실을 전달하세요. "
         "지표는 값과 의미만 설명하고, 종합 매수 등급이나 확정적인 투자 조언(무조건 오른다 등)은 "
-        "하지 마세요."
+        "하지 마세요.\n\n"
+        "중요 — 데이터가 최신인지 의심하거나('아직 안 들어온 것 같은데') 오래된 데이터라도 계산해 "
+        "달라는 질문에는, 되묻지 말고 먼저 get_indicators를 호출하세요 — 데이터가 실제로 오래됐다면 "
+        "도구 자체가 확인을 요청하는 안내를 돌려줍니다. 어떤 지표인지 되묻는 것보다 일단 시도해보는 "
+        "편이 낫습니다."
     ),
     "plan_agent": (
         "당신은 이번 달 예산·전략 계획 담당 Agent입니다. get_month_status로 현재 상태를 확인하고, "
-        "run_backtest로 과거 48개월 비교를 보여주고, select_strategy로 전략을 선택/변경합니다. "
-        "select_strategy는 반드시 confirmation_token 없이 먼저 호출해 제안 내용을 사용자에게 보여주고, "
-        "사용자가 명시적으로 동의한 뒤에만 confirmation_token을 채워 다시 호출하세요 — 동의 없이 "
-        "바로 적용하지 마세요. 과거 성과가 가장 좋았던 전략을 대신 골라주지 마세요, 선택은 항상 "
-        "사용자가 합니다."
+        "run_backtest로 과거 48개월 비교를 보여주고, select_strategy로 전략을 선택/변경하고, "
+        "set_monthly_budget으로 월 예산을 설정/변경하고, evaluate_current_condition으로 이번 달 "
+        "놓친 매수 신호를 다시 확인합니다(예: '며칠 전에 조건 충족됐다는데 지금도 매수 가능해?'). "
+        "이 재계산은 과거 신호가 있었다는 사실만 알려줄 뿐 '그러니 지금도 매수하라'는 뜻은 아니라는 "
+        "점을 항상 함께 안내하세요. "
+        "select_strategy와 set_monthly_budget은 둘 다 호출 즉시 반영되지 않고 제안만 만듭니다 — "
+        "제안 내용을 사용자에게 보여주면, 실제 적용은 사용자가 각각 POST /confirm_strategy_change /  "
+        "POST /confirm_budget_change 로 확인해야 이뤄집니다(도구 자체에 확인 토큰을 다시 채워 부르는 "
+        "경로도 있지만, 이 API는 대화 기록이 없는 무상태라 보통은 전용 엔드포인트가 실제로 쓰입니다). "
+        "동의 없이 바로 적용된 것처럼 말하지 마세요. 과거 성과가 가장 좋았던 전략을 대신 골라주지 "
+        "마세요, 선택은 항상 사용자가 합니다.\n\n"
+        "중요 — 월 구분: '계획 시작월'(월 예산을 처음 설정한 이후 실제로 집행이 시작되는 달, 월중 "
+        "가입이면 다음 달부터), '조회 대상 월'(사용자 질문이 가리키는 그 달), '그 달의 전략 선택 "
+        "여부'는 서로 다른 개념입니다. '다음 달' 질문에는 다음 달 연/월로만 get_month_status/ "
+        "select_strategy를 호출해 그 결과로만 답하세요 — 답을 만들며 이번 달 상태도 함께 확인했다면 "
+        "반드시 어느 달 이야기인지 문장마다 명확히 밝히고, '이번 달은 계획이 시작되지 않았다'는 "
+        "사실과 '다음 달 전략이 선택/제안됐다'는 사실을 뒤섞어 계획 전체가 시작 안 된 것처럼 들리게 "
+        "하지 마세요.\n\n"
+        "중요 — 전략 '조건/정의' 질문은 당신 몫이 아닙니다: 하락일/정기 분할/RSI 전략의 정확한 "
+        "발동 조건이나 계산 방식을 묻는 질문(예: '하락일 조건이 뭐야?')에는 당신이 아는 대로 "
+        "답하지 마세요 — 도구가 없어 근거 없이 답하면 실제 규칙과 다를 수 있습니다(실사용 중 발견:  "
+        "'전일 대비 하락'이라고 잘못 답한 적 있음 — 실제 규칙은 '당일 시가 대비 -5% 이하 AND 월 "
+        "첫 매수가 미만'). 그런 질문은 '정확한 조건은 문서 검색 결과를 참고하세요'라고만 안내하고, "
+        "당신은 상태 조회·백테스트·전략 선택 결과만 책임지세요.\n\n"
+        "중요 — set_monthly_budget은 호출한다고 바로 반영되지 않고 제안만 만듭니다(승인 없이 즉시 "
+        "반영되던 이전 방식에서 2026-09-18 변경) — 이 도구 자체가 이미 확인을 기다리는 '제안' "
+        "단계이므로, **'매달 200만원씩 투자할래'처럼 금액과 시작 의사가 명확한 지시라면 되묻지 말고 "
+        "바로 이 도구를 호출하세요.** 도구가 만든 제안에 대한 실제 동의 여부는 사용자가 별도로 "
+        "/confirm_budget_change로 표시하니, 당신이 도구 호출 전에 자연어로 '진행할까요?'라고 먼저 "
+        "되물을 필요가 없습니다 — 그렇게 하면 제안 자체가 생성되지 않아 사용자가 확인할 대상(토큰)이 "
+        "없어져 버립니다. 다음 경우에만 호출하지 말고 말로 답하세요(단, 설명을 생략하고 '설정할까요?' "
+        "라고만 되묻지 마세요 — 실제 내용을 먼저 설명하세요): "
+        "(1) '~하면 얼마나 살 수 있어?'처럼 금액을 예시·계산에만 쓰는 질문 — 이런 계산은 "
+        "price_agent 몫이니 당신에게 왔다면 라우팅이 잘못됐을 수 있습니다, "
+        "(2) '~로 하는 예시를 설명해줘'처럼 실제 적용이 아니라 설명을 요청하는 질문 — 월 200만원 "
+        "이면 전략별로 어떻게 나눠 매수되는지 등을 실제로 설명하세요, "
+        "(3) 이 서비스는 BTC 전용 예산만 관리합니다 — 사용자가 BTC가 아닌 다른 자산(이더리움 등)에 "
+        "대한 금액을 말하면, 그 금액으로 BTC 예산 제안을 만들지 말고 '이 서비스는 BTC 예산만 "
+        "관리합니다. BTC로 설정하시겠어요?'라고 되물으세요.\n\n"
+        "중요 — 예산 제안 응답에서는 금액·적용월·저장 여부·확인/취소 방법을 당신이 직접 서술하지 "
+        "마세요(2026-09-19 수정: 이전엔 '반드시 포함하라'였는데, 그러면 시스템이 덧붙이는 안내와 "
+        "내용이 겹치거나 서로 다른 표현이 되어 모순처럼 보일 위험이 있었습니다) — set_monthly_budget "
+        "제안이 있으면 시스템이 금액·적용월·'아직 저장되지 않았다'는 사실·정확한 API 경로(POST "
+        "/confirm_budget_change, POST /cancel_budget_change)를 항상 정확한 문구로 **한 번만** "
+        "자동으로 덧붙입니다. **당신의 답변에는 'POST /confirm_budget_change'나 "
+        "'POST /cancel_budget_change'라는 문자열 자체를 쓰지 마세요** — '확인하려면 ~로 보내세요' "
+        "식의 안내 문장도 쓰지 마세요, 그 안내 자체가 시스템이 이미 붙일 몫입니다. 당신의 문장은 "
+        "'예산 설정 제안을 만들었습니다' 정도로 끝내고, 구체적인 숫자·날짜·API 경로·확인 방법 안내는 "
+        "전부 생략하세요(생략해도 사용자가 못 보는 게 아니라, 뒤에 시스템이 자동으로 붙입니다). "
+        "다음도 함께 지키세요: "
+        "(a) 전략을 아직 안 골랐다는 이유로 예산 확인을 미루라고 하거나 전략 선택을 먼저 요구하지 "
+        "마세요 — 예산 확인과 전략 선택은 독립된 절차입니다. "
+        "(b) 아직 채팅 UI가 없습니다 — 어떤 경우에도 '확인 버튼을 누르세요' 같은 존재하지 않는 UI를 "
+        "안내하지 마세요. "
+        "(c) 예산 제안 직후 응답에서는 '다음 단계'를 예산 확인/취소 하나로만 못박으세요 — 전략 "
+        "선택이나 백테스트를 '선택 사항으로라도' 다음 단계처럼 함께 물어보지 마세요(예: '전략도 "
+        "골라보시겠어요?' 같은 문장 금지). 예산 확인 전에는 둘 다 아직 언급할 단계가 아닙니다 — "
+        "사용자가 먼저 예산을 확인/취소한 뒤, 별도로 물어보면 그때 전략·백테스트를 안내하세요. "
+        "같은 응답에 research_agent의 설명이 함께 나올 수 있는데, 당신도 research_agent도 서로 "
+        "다른 다음 단계를 재촉하며 끝맺지 마세요 — 다음 행동은 '예산 확인 또는 취소'(위 API로) "
+        "하나뿐이어야 합니다.\n\n"
+        "중요 — '뭐부터 해야 해?'/'어떻게 시작해?'/'처음인데 도와줘'처럼 서비스를 어떻게 시작할지 "
+        "묻는 질문(2026-09-19 발견 — 라우팅이 안 걸려 도메인 밖으로 거절되던 결함을 고쳤습니다): "
+        "먼저 get_month_status를 호출해 **실제 상태를 확인**하고 그 결과로만 답하세요, 짐작하지 "
+        "마세요. "
+        "(a) 계획이 아직 시작되지 않았다면(get_month_status가 그렇게 알려줍니다), '월 예산부터 "
+        "정하면 시작됩니다'라고 안내하세요 — 하지만 **사용자가 구체적인 금액을 말하지 않았다면 "
+        "set_monthly_budget을 임의의 금액으로 추측해서 호출하지 마세요.** 얼마로 시작하고 싶은지 "
+        "먼저 물어보고, 사용자가 실제 금액을 말하면 그때 제안을 만드세요. "
+        "(b) 계획은 시작됐지만 전략이 미선택이라면, 전략을 고르라고 안내하되 마찬가지로 "
+        "select_strategy를 임의의 전략으로 대신 호출하지 마세요 — 선택은 항상 사용자가 합니다. "
+        "(c) 이미 예산·전략이 모두 설정돼 있다면, 그 상태를 그대로 안내하고 특별히 뭘 더 하라고 "
+        "재촉하지 마세요. "
+        "(d) 이 API는 대화 기록이 없는 무상태입니다 — '그다음은?'처럼 이전 대화를 전제하는 질문이 "
+        "와도 실제로 나눈 적 없는 대화 내용을 기억하는 척 추측해 답하지 마세요. get_month_status가 "
+        "돌려준 실제 상태만 근거로 삼고, 무엇을 묻는 건지 애매하면 무엇을 원하는지 한두 마디로 짧게 "
+        "되물으세요."
     ),
     "research_agent": (
         "당신은 BTC·DCA·지표·서비스 규칙 문서 검색 담당 Agent입니다. retrieve_docs 도구로 찾은 내용만 "
-        "근거로 답하세요. 문서에 없는 내용은 답하지 마세요."
+        "근거로 답하세요. 문서에 없는 내용은 답하지 마세요 — 검색 결과가 질문에 정확히 답하지 못하면, "
+        "지어내 채우지 말고 '문서에서 그 부분은 확인하지 못했습니다'라고 인정하세요.\n\n"
+        "중요 — 검색어 구성: 검색은 의미 유사도 기반이라 질문을 대충 요약한 검색어로는 이 서비스 "
+        "고유 규칙 문서(`dca_strategy.md`/`service_rules.md`)보다 일반 개념 문서(`DCA.md`)만 걸릴 "
+        "수 있습니다(실사용 중 발견: '서비스 개요 소개 BTC DCA 투자'로 검색하면 `DCA.md`만 4개 나오고 "
+        "`dca_strategy.md`/`service_rules.md`는 전혀 안 나옴). '이 서비스가 뭘 해주는지'/'처음 이용'/"
+        "'세 가지 매수 방식'을 설명해야 하는 질문에는 '최초 이용 세 가지 매수 방식 하락일 정기 분할 "
+        "RSI 매수 조건'처럼 이 서비스 고유 용어를 구체적으로 넣어 검색하세요 — 'DCA'라는 단어 하나에만 "
+        "기대지 마세요.\n\n"
+        "중요 — 절대 틀리면 안 되는 사실 세 가지(문서 내용과 무관하게 항상 참): "
+        "(1) 세 전략 모두 매달 1일에 예산 절반을 조건 없이 정액 매수하고, 나머지 절반만 전략별로 "
+        "다르게 처리합니다 — '정기 분할'만 특별한 게 아닙니다. "
+        "(2) '정기 분할'은 매월 15일에 나머지 절반을 매수합니다 — '2주마다'/'격주'가 아니라 한 달에 "
+        "1일·15일 두 번입니다. 내부 식별자 'biweekly'의 영어 뜻(2주 간격)에 이끌려 '2주마다'라고 "
+        "쓰지 마세요, 실제 규칙은 이 문서의 '1일·15일'입니다. "
+        "(3) 이 서비스는 실제 주문을 자동으로 넣지 않습니다 — 매수는 항상 사용자가 직접 하고 그 "
+        "결과를 신고합니다. '자동 매수'/'자동으로 진행됩니다' 같은 표현을 쓰지 마세요.\n\n"
+        "중요 — 역할 경계: 이 문서들은 서비스의 일반 개념·규칙만 설명하며, 특정 사용자의 실제 상태"
+        "(현재 예산, 실제로 선택된 전략, 계획 시작 여부, 매수·관망 기록 등)는 담고 있지 않습니다. "
+        "질문에 '내 전략', '이번 달', '다음 달' 처럼 개인 상태를 묻는 부분이 섞여 있어도, 문서 내용을 "
+        "근거로 '선택됐다/안 됐다', '시작됐다/안 됐다' 같은 사용자의 실제 현재 상태를 추측하거나 "
+        "단정하지 마세요 — 그 부분은 plan_agent/ledger_agent가 실시간 조회로 따로 답합니다. 일반"
+        "개념·서비스 규칙 설명에만 집중하고, 실제 상태 안내가 필요하면 '실제 현재 상태는 계획 상태 "
+        "조회 결과를 참고하세요' 정도로 한 문장만 짧게 덧붙이세요 — 이미 다른 Agent가 실시간 상태를 "
+        "답했을 수 있으니 어떻게 확인하라고 길게 설명하지 마세요. 실행 관련 다음 단계(전략 선택 여부 "
+        "등)를 먼저 묻거나 재촉하지 마세요 — 그건 plan_agent 몫입니다, 당신은 개념 설명으로 "
+        "마무리하세요."
     ),
     "ledger_agent": (
         "당신은 실제 매수·관망 기록 담당 Agent입니다. 실제 거래소 주문은 발생하지 않는다는 점을 항상 "
         "분명히 하세요. 매수 기록 생성·수정·취소·초기화는 도구가 승인 절차를 거칩니다. 매수 기록 "
-        "수정·취소는 장부 정정일 뿐 실제 거래 취소가 아니라는 점도 함께 안내하세요."
+        "수정·취소는 장부 정정일 뿐 실제 거래 취소가 아니라는 점도 함께 안내하세요.\n\n"
+        "중요 — '이번 달'/'다음 달'처럼 특정 달을 콕 집어 기록을 물으면 search_ledger에 반드시 "
+        "그 연/월을 채워 호출하세요. 비워서 부르면 전체 기간 기록이 나오는데, plan_agent가 같은 "
+        "질문에 특정 달 기준 예산·매수 여부로 답하면 두 답이 서로 다른 범위를 보고 있는데도 "
+        "모순처럼 들릴 수 있습니다."
     ),
 }
 
@@ -432,10 +671,32 @@ _AGENT_KEYWORDS: dict[str, list[str]] = {
     "price_agent": [
         "가격", "시세", "현재가", "지표", "이동평균", "이평", "rsi", "드로다운",
         "얼마", "급등", "급락", "price", "indicator",
+        # 실사용 중 발견(2026-09-17, evaluation #15): "데이터가 아직 안 들어온 것 같은데 그래도
+        # 계산해줘"처럼 지표 계산/신선도를 묻는 질문인데 위 키워드를 하나도 안 써서 route_question이
+        # 아무 Agent도 못 찾아 도메인 밖 취급하던 것을 발견했다.
+        "계산",
     ],
     "plan_agent": [
         "예산", "남은 예산", "이번 달", "이번달", "전략", "백테스트", "시뮬레이션", "비교",
         "선택", "변경", "budget", "backtest", "strategy", "정기 분할", "정기분할", "하락일",
+        # evaluate_current_condition(§5 놓친 신호 재계산) 연결(2026-09-18) — "며칠 전에 조건이
+        # 충족됐는데 지금도 매수 가능해?" 같은 질문을 라우팅에 걸리게 한다.
+        "조건", "충족", "신호", "놓친",
+        # 2026-09-18: 예산 액수 표현("매달 200만원씩...")은 리터럴 키워드가 아니라 아래
+        # _KRW_AMOUNT_RE + 반복 주기 단어 조합으로 route_question에서 별도 처리한다 — "만원"만
+        # 단독 키워드로 두면 "BTC 1만원이면 얼마나 살 수 있어?"(예산 변경 의도가 전혀 아닌 조회
+        # 질문)까지 걸려버려서, 실제로는 반복 주기 단어("매달"/"한 달에" 등)와 함께 있을 때만
+        # 매칭하도록 뒤에서 추가 검사한다. 쉼표 표기("2,000,000원")·띄어쓰기("200만 원") 모두
+        # 커버해야 한다는 지적을 받아 정규식으로 바꿨다(리터럴 "만원" 문자열 검사로는 두 표현 다
+        # 놓친다). 아래 route_question 참고.
+        # 수동 테스트 중 발견(2026-09-19): "뭐부터 해야할지 알려줘"/"어떻게 시작해?"/"처음인데
+        # 도와줘"/"뭐부터 하면 돼?"/"어떻게 시작하면 돼?"처럼 서비스 이용을 어떻게 시작할지 묻는
+        # 질문이 "예산"/"전략" 같은 기존 키워드를 전혀 안 써서 route_question이 빈 목록을 반환하고
+        # 도메인 밖으로 거절되던 것을 발견했다. "시작" 한 단어만 넣으면 "이 캔들은 언제 시작해?" 같은
+        # 무관한 질문까지 걸릴 수 있어(지적받음), 서비스 이용 시작 의도를 나타내는 구체적인 문구
+        # ("뭐부터", "어떻게 시작", "처음인데")만 매칭시킨다 — 실제 상태 확인은 get_month_status가
+        # 하므로 이 세 문구는 plan_agent에만 매칭시켜도 충분하다.
+        "뭐부터", "어떻게 시작", "처음인데",
     ],
     "research_agent": [
         "전략", "원칙", "정의", "용어", "리스크", "관리", "란", "무엇", "dca",
@@ -444,14 +705,45 @@ _AGENT_KEYWORDS: dict[str, list[str]] = {
         # 실시간 조회만으로는 답이 grounding 없이 LLM의 일반 지식(부정확할 수 있음)에 의존하게
         # 됩니다. research_agent도 함께 매칭시켜 retrieve_docs로 문서 기준값을 근거로 답하게 합니다.
         "이동평균", "이평", "rsi", "드로다운", "과매도", "과매수",
+        # 실사용 중 발견(2026-09-17, evaluation #4): "하락일 매수 조건이 뭐야?" 같은 질문이 "전략"
+        # 이라는 단어를 안 써서 research_agent가 안 걸리고 plan_agent(도구에 retrieve_docs가 없어
+        # 문서 근거 없이 답함)만 매칭되던 것을 발견했다 — plan_agent와 같은 전략명 키워드를 공유한다.
+        "정기 분할", "정기분할", "하락일",
+        # RAGAS 전용 평가 세트(evaluation/rag_eval_set.json) 구성 중 발견(2026-09-18): "백테스트
+        # 결과는 어떻게 해석해야 하는가?"/"월말 잔여 예산은 어떻게 처리되는가?"가 plan_agent에만
+        # 걸리고(도구에 retrieve_docs가 없음) research_agent는 안 걸려 retrieve_docs가 한 번도
+        # 호출되지 않았다 — RAGAS 실행에서 해당 두 문항의 context가 0건으로 나와 발견했다.
+        "백테스트", "월말", "잔여",
+        # 수동 테스트 중 발견(2026-09-18): "처음 쓰는데 어떤 서비스야?"/"이 서비스는 뭐 해주는
+        # 거야?"/"처음인데 사용법 알려줘"처럼 서비스 자체를 소개해달라는 최초 이용 질문이 위
+        # 어떤 키워드에도 안 걸려 route_question이 빈 목록을 반환하고 "지원 범위 밖"으로
+        # 거절되던 것을 발견했다. "서비스"/"사용법"은 최초 이용 설명을 요청할 때만 쓰이는
+        # 특정도 높은 단어라(예: "이 서비스는 뭐야?", "사용법 알려줘") 일반적인 투자 질문 전체를
+        # 허용 범위로 넓히지 않는다 — "그냥 투자 조언해줘"처럼 서비스/사용법을 언급하지 않는
+        # 진짜 범위 밖 질문은 여전히 아무 키워드에도 안 걸려 기존처럼 거절된다.
+        "서비스", "사용법",
     ],
     "ledger_agent": [
         # 매수해도/매도해도 같은 질문형("~해도 괜찮아?")까지 명령으로 오인하지 않도록,
         # 실행을 요청하는 명령형 종결(줘/라)만 매칭합니다.
         "기록", "매수해줘", "매수해라", "매도해줘", "매도해라", "청산해줘", "청산해라",
         "초기화", "리셋", "관망", "buy", "ledger", "장부",
+        # 실사용 중 발견(2026-09-17): "이번엔 안 사고 지켜볼래"처럼 "관망"이라는 단어를 안 쓰고도
+        # 관망 의도를 표현하는 자연스러운 구어체 표현이 실제로 라우팅에 안 걸려 record_watch_decision이
+        # 전혀 호출되지 않았다. "관망" 한 단어만으로는 실제 대화 표현을 못 따라가서 추가한다.
+        "지켜볼래", "지켜보자", "지켜볼게", "지켜볼", "안 살래", "안살래", "패스할래", "보류할래",
     ],
 }
+
+
+# 원화 금액 표현 — "200만원"/"200만 원"(띄어쓰기)/"2,000,000원"(쉼표) 전부 잡는다. 단독으로는
+# 매칭에 안 쓰고, 아래에서 반복 주기 단어와 함께 있을 때만 plan_agent에 추가로 매칭시킨다.
+_KRW_AMOUNT_RE = re.compile(r"\d[\d,]*\s*만?\s*원")
+# "매달 200만원씩 투자하고 싶어"류의 예산 설정 의도는 "반복 주기를 나타내는 말 + 금액"의 조합으로
+# 나타난다 — 이 조합이 아니라 금액만 있는 경우(예: "BTC 1만원이면 얼마나 살 수 있어?")는 단발성
+# 조회/계산 질문이지 예산 변경 의도가 아니므로 plan_agent에 매칭시키지 않는다(2026-09-18, 수동
+# 테스트에서 "만원" 단독 키워드가 이 경우까지 잘못 끌어들이는 것을 발견해 조합 조건으로 좁혔다).
+_RECURRING_CADENCE_WORDS = ("매달", "한 달에", "한달에", "매월")
 
 
 def route_question(question: str) -> list[str]:
@@ -461,6 +753,8 @@ def route_question(question: str) -> list[str]:
     """
     q = (question or "").lower()
     matched = [name for name, kws in _AGENT_KEYWORDS.items() if any(kw.lower() in q for kw in kws)]
+    if "plan_agent" not in matched and _KRW_AMOUNT_RE.search(q) and any(w in q for w in _RECURRING_CADENCE_WORDS):
+        matched.append("plan_agent")
     return matched
 
 
@@ -503,10 +797,24 @@ def _build_worker_graph(agent_name: str, llm):
     system_prompt = _AGENT_SYSTEM_PROMPTS[agent_name]
 
     def agent_node(state: WorkerState) -> dict:
-        # "오늘"/"어제" 같은 상대적 날짜 표현을 실제 날짜로 옮기려면 LLM이 지금이 언제인지 알아야
-        # 한다 — 실사용 중 "오늘 매수했어"에서 executed_date를 못 채우는 실패가 실제로 발견됨.
-        today_str = datetime.now(KST).strftime("%Y-%m-%d(%a)")
-        dated_prompt = f"{system_prompt}\n\n오늘 날짜는 {today_str}입니다(KST 기준). 상대적 날짜 표현(오늘/어제/이번 달 등)은 이 날짜를 기준으로 실제 날짜(YYYY-MM-DD)로 변환해 도구 인자에 채우세요."
+        # "오늘"/"어제"/"이번 달"/"다음 달" 같은 상대적 표현을 실제 날짜·연월로 옮기려면 LLM이
+        # 지금이 언제인지 알아야 한다. "오늘"만 알려줬을 때는 executed_date 누락(§7-1 아님, 실사용
+        # 발견)과 "다음 달" 계산을 틀려 get_month_status/select_strategy에 엉뚱한 연/월을 넘기는
+        # 문제가 둘 다 실제로 발견됐다 — 그래서 이번 달/다음 달까지 서버가 직접 계산해 명시적으로
+        # 박아준다(LLM의 날짜 산수에 기대지 않는다).
+        now = datetime.now(KST)
+        today_str = now.strftime("%Y-%m-%d(%a)")
+        this_y, this_m = now.year, now.month
+        next_y, next_m = (this_y + 1, 1) if this_m == 12 else (this_y, this_m + 1)
+        dated_prompt = (
+            f"{system_prompt}\n\n오늘 날짜는 {today_str}입니다(KST 기준). "
+            f"이번 달은 {this_y}년 {this_m}월(year={this_y}, month={this_m})이고, "
+            f"다음 달은 {next_y}년 {next_m}월(year={next_y}, month={next_m})입니다. "
+            "get_month_status/select_strategy 등 year/month 인자가 있는 도구를 부를 때 "
+            "'이번 달'/'다음 달' 같은 표현이 나오면 직접 계산하지 말고 위 숫자를 그대로 쓰세요. "
+            "다른 상대적 날짜 표현(어제 등)도 오늘 날짜를 기준으로 실제 날짜(YYYY-MM-DD)로 변환해 "
+            "도구 인자에 채우세요."
+        )
         messages = [SystemMessage(content=dated_prompt)] + state["messages"]
         response = llm_with_tools.invoke(messages)
         return {"messages": [response], "steps": state["steps"] + 1}
@@ -582,6 +890,86 @@ def _extract_tool_trace(messages: list) -> list[dict]:
     return entries
 
 
+_STRATEGY_LABELS = {"decline_day": "하락일 매수", "biweekly": "정기 분할(매월 1일·15일)", "rsi": "RSI 매수"}
+_ANSWER_PRIORITY = ["price_agent", "plan_agent", "ledger_agent", "research_agent"]
+
+
+def _build_final_answer(
+    answers_by_agent: dict[str, str],
+    approvals_needed: list[dict],
+    strategy_proposal: dict | None,
+    budget_proposal: dict | None,
+) -> str:
+    """Agent별 자연어 답을 우선순위대로 이어 붙인 뒤, 승인/전략변경/예산변경 제안이 있으면 항상
+    정확한 구조화 요약을 덧붙인다.
+
+    실사용 중 발견(2026-09-17, 승인): 승인이 필요한 도구 호출은 그래프가 await_approval에서 멈추면서
+    그 Worker의 안내 문구를 answers에 전혀 안 남긴다 — 다른 Agent가 답을 안 냈으면 사용자는
+    approvals_needed 필드를 직접 안 보는 한 "뭘 승인해야 하는지" 전혀 알 수 없었다.
+
+    실사용 중 발견(2026-09-18, 예산): 예산 제안이 성공적으로 생성돼도, 그 결과를 자연어로 옮기는
+    몫이 전적으로 LLM에게 맡겨져 있으면 도구가 돌려준 금액·적용월을 최종 답변에서 빠뜨리거나,
+    존재하지 않는 "확인 버튼"을 안내하거나, 전략 선택을 예산 확인의 선행 조건처럼 요구하는 등
+    부정확한 답이 나올 수 있다(judge_output의 keep=true는 "내용이 있고 근거 없는 단정이 없다"만
+    보지 "금액·월·API 경로가 정확한가"는 전혀 보지 않는다).
+
+    **2026-09-19 재수정 — 프롬프트 준수에 의존하지 않는 강제**: 처음엔 "요약 블록을 정확하게
+    덧붙이되 plan_agent의 자유 서술도 그대로 유지"하는 방식이었다. 하지만 plan_agent가 프롬프트를
+    어기고(또는 모델이 그 지시를 놓쳐서) "설정 완료했습니다"/"2주마다 자동으로 매수합니다" 같은
+    문장을 쓰면, 그 문장이 구조화 블록과 나란히 최종 답변에 그대로 노출되는 문제가 실제로
+    지적됐다 — 문서화된 한계로 남기는 것만으로는 부족하다는 지적이었다. 그래서 예산 제안이 있으면
+    **`plan_agent`의 자유 서술 자체를 최종 답변에서 제외**하고, 그 정보 전부를 구조화 요약으로
+    완전히 대체한다 — 이제 plan_agent가 프롬프트를 어겨서 뭐라고 쓰든(모델 능력에 의존하지 않고)
+    그 텍스트 자체가 애초에 합쳐지지 않으므로 노출될 수 없다. 같은 응답에 요청된 서비스 소개·전략
+    설명(예: research_agent)은 그대로 유지한다 — 제외되는 건 plan_agent의 서술뿐이다. 전략 변경
+    제안(`strategy_proposal`)에는 아직 이 처리를 적용하지 않았다(이번 요청 범위 밖 — 요청받으면
+    같은 방식으로 확장할 수 있다).
+    """
+    included = dict(answers_by_agent)
+    if budget_proposal is not None:
+        included.pop("plan_agent", None)
+    ordered_names = sorted(
+        included, key=lambda n: _ANSWER_PRIORITY.index(n) if n in _ANSWER_PRIORITY else len(_ANSWER_PRIORITY)
+    )
+    answers = [f"[{name}] {included[name]}" for name in ordered_names]
+
+    approval_lines = [f"- {a['reason']} (도구: {a['tool']}, 승인 ID: {a['approval_id']})" for a in approvals_needed]
+    approval_summary = ("[실행 전 확인 필요]\n" + "\n".join(approval_lines)) if approval_lines else ""
+
+    strategy_summary = ""
+    if strategy_proposal is not None:
+        sp = strategy_proposal
+        strategy_label = _STRATEGY_LABELS.get(sp["strategy"], sp["strategy"])
+        strategy_summary = (
+            "[전략 변경 확인 필요]\n"
+            f"- {sp['year']}년 {sp['month']}월 전략을 '{strategy_label}'(으)로 바꾸는 제안이며, "
+            "아직 저장되지 않았습니다.\n"
+            f"- 적용하려면 confirmation_token(\"{sp['confirmation_token']}\")을 "
+            "POST /confirm_strategy_change 로 보내세요(POST /cancel_strategy_change 로 취소)."
+        )
+
+    budget_summary = ""
+    if budget_proposal is not None:
+        bp = budget_proposal
+        verb = "시작" if bp["is_initial"] else "변경"
+        budget_summary = (
+            "[예산 확인 필요]\n"
+            f"- 월 예산을 {bp['amount_krw']:,.0f}원으로 {verb}하는 제안이며, {bp['effective_month']}부터 "
+            "적용될 예정입니다. 아직 저장되지 않았습니다.\n"
+            f"- 적용하려면 confirmation_token(\"{bp['confirmation_token']}\")을 "
+            "POST /confirm_budget_change 로 보내세요(POST /cancel_budget_change 로 취소)."
+        )
+
+    if not answers and not approval_summary and not strategy_summary and not budget_summary:
+        return "쓸 만한 답을 만들지 못했습니다. 질문을 조금 더 구체적으로 해주세요."
+
+    parts = list(answers)
+    for summary in (approval_summary, strategy_summary, budget_summary):
+        if summary:
+            parts.append(summary)
+    return "\n\n".join(parts) if parts else "승인이 필요한 작업이 있어 답변을 만들지 못했습니다."
+
+
 # ══════════════════════════════════════════════════════════════════
 # Supervisor
 # ══════════════════════════════════════════════════════════════════
@@ -596,9 +984,11 @@ def build_supervisor(llm=None):
     worker_graphs = {name: _build_worker_graph(name, llm) for name in AGENT_NAMES}
 
     def run(question: str, proceed_with_stale_data: bool = False) -> dict:
-        global _LAST_DATA_GAP
+        global _LAST_DATA_GAP, _LAST_STRATEGY_PROPOSAL, _LAST_BUDGET_PROPOSAL
         _REQUEST_CONTEXT["proceed_with_stale_data"] = proceed_with_stale_data
         _LAST_DATA_GAP = None
+        _LAST_STRATEGY_PROPOSAL = None
+        _LAST_BUDGET_PROPOSAL = None
         trace: list[dict] = []
 
         blocked, guard_reason = guardrails.input_guard(question)
@@ -624,7 +1014,7 @@ def build_supervisor(llm=None):
                 "approvals_needed": [],
             }
 
-        answers: list[str] = []
+        answers_by_agent: dict[str, str] = {}
         approvals_needed: list[dict] = []
         _LAST_RETRIEVED_DOCS.clear()
 
@@ -639,20 +1029,27 @@ def build_supervisor(llm=None):
                 trace.append({"step": "approval_required", "input": result["pending_approval"], "output": "실행 보류"})
                 continue
 
-            final_text = result["messages"][-1].content
+            # ChatBedrockConverse(특히 sonnet-4-5)는 최종 답변의 content를 문자열이 아니라
+            # 블록 리스트로 줄 때가 실제로 있다(retriever.get_text가 이미 이 문제를 처리해 둔
+            # 이유와 같음) — 그대로 str()하면 "[{'type': 'text', ...}]" 같은 걸 그대로 노출하고,
+            # judge_output은 .strip() 호출에서 바로 죽는다. 같은 헬퍼를 재사용해 정규화한다.
+            final_text = retriever.get_text(result["messages"][-1])
             verdict = judge_output(name, final_text)
             trace.append({"step": f"judge:{name}", "input": final_text, "output": verdict})
             if verdict["keep"]:
-                answers.append(f"[{name}] {final_text}")
+                answers_by_agent[name] = final_text
 
         contexts = [
             {"doc_id": d.metadata.get("source", "unknown"), "text": d.page_content} for d in _LAST_RETRIEVED_DOCS
         ]
 
-        if not answers and not approvals_needed:
-            answer = "쓸 만한 답을 만들지 못했습니다. 질문을 조금 더 구체적으로 해주세요."
-        else:
-            answer = "\n\n".join(answers) if answers else "승인이 필요한 작업이 있어 답변을 만들지 못했습니다."
+        # 실시간 상태 답(price/plan/ledger_agent)을 항상 일반 개념 설명(research_agent)보다 앞에
+        # 배치한다 — 사용자 상태 정보와 일반 설명의 역할을 답변 순서에서도 구분해, 상태 답이 먼저
+        # 읽히고 문서 기반 설명은 보충 설명으로 뒤에 오도록 한다(기획팀 지적: 개인 상태와 일반 개념
+        # 설명이 나란히 섞이면 모순처럼 보일 수 있다). 정렬·plan_agent 제외 로직은
+        # _build_final_answer로 옮겼다 — Agent별 딕셔너리를 그대로 넘겨야 예산 제안이 있을 때
+        # plan_agent 항목만 선택적으로 뺄 수 있다(2026-09-19).
+        answer = _build_final_answer(answers_by_agent, approvals_needed, _LAST_STRATEGY_PROPOSAL, _LAST_BUDGET_PROPOSAL)
 
         response = {
             "answer": answer,
@@ -663,6 +1060,10 @@ def build_supervisor(llm=None):
         }
         if _LAST_DATA_GAP is not None:
             response["data_gap_needs_confirmation"] = _LAST_DATA_GAP
+        if _LAST_STRATEGY_PROPOSAL is not None:
+            response["strategy_change_needs_confirmation"] = _LAST_STRATEGY_PROPOSAL
+        if _LAST_BUDGET_PROPOSAL is not None:
+            response["budget_change_needs_confirmation"] = _LAST_BUDGET_PROPOSAL
         return response
 
     return run
@@ -696,3 +1097,43 @@ def reject_approved_action(approval_id: str) -> dict:
     if not ok:
         return {"http_status": 409, "error": f"이미 처리 중이거나 처리된 승인입니다(상태: {status})."}
     return {"http_status": 200, "approval_id": approval_id, "status": "rejected"}
+
+
+def confirm_strategy_change_action(confirmation_token: str) -> dict:
+    """`select_strategy`가 제안한 전략 변경을 실제로 적용한다 — approvals.py의 승인ID와는 별개의
+    저장소(month_state._PENDING_STRATEGY_CHANGES)를 쓰지만, 대화·라우팅을 거치지 않고 토큰만으로
+    직접 처리한다는 점은 execute_approved_action과 같은 이유다(실사용 중 발견: 이 API가 무상태라
+    "응 확인했어" 같은 자연어 확인은 라우팅조차 안 되므로, 확인은 반드시 이 구조화 경로로 와야 한다).
+    """
+    result = month_state.confirm_strategy_change(confirmation_token)
+    if not result["ok"]:
+        return {"http_status": 404, "error": result["error"]}
+    return {"http_status": 200, **result}
+
+
+def cancel_strategy_change_action(confirmation_token: str) -> dict:
+    """`select_strategy`가 제안한 전략 변경을 취소한다 — 적용하지 않고 토큰만 무효화한다."""
+    result = month_state.cancel_strategy_change(confirmation_token)
+    if not result["ok"]:
+        return {"http_status": 404, "error": result["error"]}
+    return {"http_status": 200, **result}
+
+
+def confirm_budget_change_action(confirmation_token: str) -> dict:
+    """`set_monthly_budget`이 제안한 예산 설정/변경을 실제로 적용한다(SPEC §4-2, 2026-09-18 확정).
+    존재한 적 없는 토큰은 404, 이미 확인·취소로 소진됐거나 제안 이후 상태·시점이 달라져 낡은
+    제안이 된 경우는 409로 구분한다 — approvals.py/select_strategy 확인과 같은 원칙."""
+    result = month_state.confirm_budget_change(confirmation_token)
+    if not result["ok"]:
+        status = 409 if (result.get("already_processed") or result.get("stale")) else 404
+        return {"http_status": status, "error": result["error"]}
+    return {"http_status": 200, **result}
+
+
+def cancel_budget_change_action(confirmation_token: str) -> dict:
+    """`set_monthly_budget`이 제안한 예산 설정/변경을 취소한다 — 적용하지 않고 토큰만 무효화한다."""
+    result = month_state.cancel_budget_change(confirmation_token)
+    if not result["ok"]:
+        status = 409 if result.get("already_processed") else 404
+        return {"http_status": status, "error": result["error"]}
+    return {"http_status": 200, **result}

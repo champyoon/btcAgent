@@ -21,9 +21,14 @@ data/price_cache.json
 data/price_history.json
 data/month_state.json
 
+# 실 장부와 분리된 수동(Swagger) 테스트용 데이터 디렉터리 — BTC_AGENT_DATA_DIR로 지정해서 사용
+data_manual_test/
+
 # IDE
 .vscode/
 .idea/
 
 # Testing
 .pytest_cache/
+evaluation/_eval_scratch/
+evaluation/llm_as_judge_results.json

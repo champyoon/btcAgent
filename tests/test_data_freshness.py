@@ -1,0 +1,70 @@
+"""최신 확정 일봉 누락 시 stale-data 확인 요구, 필수 과거 데이터 부족 시 계산 불가 — SPEC §6-2·§7-1.
+
+네트워크 호출(Upbit API) 없이 검증한다 — check_freshness/compute_drawdown은 로컬 캐시/입력만 본다.
+"""
+
+from datetime import date, datetime, timedelta
+
+import indicators
+import price_history as ph
+
+
+def test_check_freshness_detects_stale_cache():
+    ph.save_history([{"date_kst": "2026-09-10", "open": 1, "high": 1, "low": 1, "close": 1}])
+    now = datetime(2026, 9, 17, 10, 0, tzinfo=ph.KST)  # 09:00 이후 -> 기대 확정일 2026-09-16
+    result = ph.check_freshness(now=now)
+    assert result["fresh"] is False
+    assert result["expected"] == "2026-09-16"
+    assert result["last_available"] == "2026-09-10"
+
+
+def test_check_freshness_fresh_when_cache_matches_expected():
+    ph.save_history([{"date_kst": "2026-09-16", "open": 1, "high": 1, "low": 1, "close": 1}])
+    now = datetime(2026, 9, 17, 10, 0, tzinfo=ph.KST)
+    result = ph.check_freshness(now=now)
+    assert result["fresh"] is True
+
+
+def test_agent_freshness_gate_blocks_then_allows_with_override():
+    import agent
+
+    ph.save_history([{"date_kst": "2020-01-01", "open": 1, "high": 1, "low": 1, "close": 1}])
+    agent._REQUEST_CONTEXT["proceed_with_stale_data"] = False
+    msg = agent._freshness_gate_message()
+    assert msg is not None
+    assert "확인" in msg
+    assert agent._LAST_DATA_GAP is not None
+
+    agent._REQUEST_CONTEXT["proceed_with_stale_data"] = True
+    msg2 = agent._freshness_gate_message()
+    assert msg2 is None
+    agent._REQUEST_CONTEXT["proceed_with_stale_data"] = False  # 다른 테스트에 영향 안 주도록 복원
+
+
+def test_compute_drawdown_none_when_a_day_missing_in_window():
+    base = date(2026, 1, 1)
+    candles = []
+    for i in range(30):
+        if i == 15:
+            continue  # 중간 하루 결측 — 임의로 채우거나 기간을 늘리면 안 된다
+        d = base + timedelta(days=i)
+        candles.append({"date_kst": d.isoformat(), "high": 100.0, "close": 100.0})
+    assert indicators.compute_drawdown(candles, days=30) is None
+
+
+def test_compute_drawdown_computes_when_window_is_complete():
+    base = date(2026, 1, 1)
+    candles = [
+        {"date_kst": (base + timedelta(days=i)).isoformat(), "high": 100.0 + i, "close": 90.0}
+        for i in range(30)
+    ]
+    result = indicators.compute_drawdown(candles, days=30)
+    assert result is not None
+    expected_high = max(c["high"] for c in candles)
+    assert result["high"] == expected_high
+    assert abs(result["pct"] - ((90.0 / expected_high - 1) * 100)) < 1e-9
+
+
+def test_compute_ma_deviation_none_when_insufficient_history():
+    closes = [100.0] * 50  # 200일 이동평균에 필요한 데이터보다 적음
+    assert indicators.compute_ma_deviation_pct(closes, 200) is None

@@ -21,5 +21,14 @@ requests>=2.31
 # ragas>=0.4는 scikit-network가 필수 의존성인데 Python 3.14용 사전빌드 wheel이 없어
 # 소스 빌드(Visual C++ 빌드 도구 필요)로 떨어진다. 0.3.0은 이 의존성이 없어 그대로 설치된다
 # (evaluation/_ragas_compat.py가 langchain-community 최신판과의 자잘한 호환성만 보정).
+# langchain-community/pillow는 ragas가 import 시점에 필요로 하는 간접 의존성(둘 다 명시적으로
+# requirements에 없으면 ImportError로 막힘 — 2026-09-17 round3 평가 중 발견).
+# 그래도 ragas 0.3.0의 비동기 실행기는 Python 3.14의 강화된 asyncio.timeout() 규칙과 호환되지
+# 않아(RuntimeError: "Timeout should be used inside a task") 실제 채점(context_recall 등)은
+# 안 된다 — evaluation/round3_report.md §6 참고. 설치는 되지만 결과는 기대하지 말 것.
 ragas==0.3.0
+langchain-community
 pillow>=10.4
+
+# ── 단위 테스트 (tests/) ──────────────────────────────────────
+pytest>=8.0

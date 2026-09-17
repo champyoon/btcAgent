@@ -8,12 +8,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+# BTC_AGENT_DATA_DIR가 설정돼 있으면 그 경로를 쓴다(수동 테스트용 격리 데이터 디렉터리 지정 —
+# 미설정 시 기존과 동일하게 실제 data/ 디렉터리를 그대로 쓴다).
+DATA_DIR = Path(os.environ.get("BTC_AGENT_DATA_DIR") or (Path(__file__).resolve().parents[1] / "data"))
 LEDGER_PATH = DATA_DIR / "ledger.json"
 
 KST = timezone(timedelta(hours=9))
@@ -272,8 +275,27 @@ def cancel_virtual_buy(record_id: str, reason: str = "") -> dict:
     return {"ok": True, "record": updated, "note": "장부 정정입니다 — 실제 거래 취소가 아닙니다."}
 
 
-def search_ledger() -> list[dict]:
-    return load_ledger()
+def search_ledger(year: int = 0, month: int = 0) -> list[dict]:
+    """§4 조회. year/month를 지정하면 그 달 기록만 걸러 반환한다(둘 다 지정해야 필터링됨).
+
+    실사용/평가 중 발견(2026-09-17): 필터가 없어 "이번 달 매수 기록 보여줘"에도 항상 전체 기간
+    기록이 나왔다 — plan_agent가 같은 질문에 "이번 달" 기준으로만 집계한 답(예: 이번 달엔 매수
+    없음)을 내놓으면, 다른 달 기록까지 섞인 이 결과와 서로 모순돼 보였다.
+    """
+    entries = load_ledger()
+    if not year or not month:
+        return entries
+    prefix = f"{year:04d}-{month:02d}"
+
+    def _matches(e: dict) -> bool:
+        if e["type"] == "buy":
+            return (e.get("executed_date") or "").startswith(prefix)
+        # watch 기록엔 executed_date가 없다 — recorded_at(UTC ISO)의 앞 7자로 대략 걸러도 월 경계
+        # 근처 하루 오차 정도만 생기고(그 정도는 관망 기록 조회에서 치명적이지 않음), 정확한 KST
+        # 변환까지는 여기서 하지 않는다.
+        return (e.get("recorded_at") or "")[:7] == prefix
+
+    return [e for e in entries if _matches(e)]
 
 
 def reset_ledger() -> dict:
@@ -312,3 +334,23 @@ def average_buy_price(entries: list[dict] | None = None) -> float | None:
     if total_qty <= 0:
         return None
     return total_amount / total_qty
+
+
+def first_buy_price_for_month(year: int, month: int, entries: list[dict] | None = None) -> float | None:
+    """§3 하락일 조건의 "월 첫 매수가" — 그 달 유효(active) 매수 중 executed_date가 가장 이른
+    기록의 가격. price_krw가 없으면 amount_krw/quantity_btc로 역산한다. 매수가 없으면 None
+    (§5 놓친 신호 재계산이 "첫 매수 기록이 없어 판정 불가"로 안내할 때 쓴다)."""
+    entries = entries if entries is not None else load_ledger()
+    prefix = f"{year:04d}-{month:02d}"
+    active_buys = [
+        e for e in entries if e["type"] == "buy" and e["status"] == "active" and (e.get("executed_date") or "").startswith(prefix)
+    ]
+    if not active_buys:
+        return None
+    first = min(active_buys, key=lambda e: e["executed_date"])
+    if first.get("price_krw") is not None:
+        return first["price_krw"]
+    qty = first.get("quantity_btc")
+    if qty:
+        return first["amount_krw"] / qty
+    return None

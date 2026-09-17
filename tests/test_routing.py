@@ -98,3 +98,43 @@ def test_bare_start_word_in_unrelated_context_is_not_broadly_matched():
     for q in ["이 영화 언제 시작해?", "오늘 저녁 메뉴 추천해줘", "행사 시작 시간이 몇 시야?"]:
         matched = agent.route_question(q)
         assert matched == [], f"무관한 질문인데 라우팅이 걸림(허용 범위가 의도치 않게 넓어짐): {q!r} -> {matched}"
+
+
+def test_buy_timing_verdict_questions_reach_price_agent():
+    """수동 테스트 중 발견(2026-09-19): "현재 btc를 매수하기에 좋은시기인지 알려줘"가 route=[]로
+    거절됐다 — 이 서비스는 종합 매수 판정을 의도적으로 제공하지 않지만(SPEC §3-1), 그건 "예/아니오로
+    답하지 않는다"는 뜻이지 "질문 자체를 범위 밖으로 거절한다"는 뜻이 아니다. price_agent가 지표
+    값·의미로 답하고 판정만 거절하도록(프롬프트) 라우팅을 고쳤다."""
+    phrasings = [
+        "현재 btc를 매수하기에 좋은시기인지 알려줘",
+        "지금이 매수 타이밍이야?",
+        "지금이 살 때야?",
+        "BTC 사기 좋은 시기야?",
+    ]
+    for q in phrasings:
+        matched = agent.route_question(q)
+        assert "price_agent" in matched, f"매수 시기 질문이 price_agent에 안 걸림: {q!r}"
+
+
+def test_budget_decision_without_recurring_cadence_word_reaches_plan_agent():
+    """수동 테스트 중 발견(2026-09-19): 백테스트 결과를 본 뒤 "나는 일단 200만원으로 진행해볼래"가
+    "매달"/"한 달에" 같은 반복 주기 단어를 안 써서 _RECURRING_CADENCE_WORDS 조합에 안 걸리고
+    route_question이 빈 목록을 반환했다 — set_monthly_budget은 애초에 "이번 달 예산"을 다루는
+    도구라 매번 반복 주기를 말해야만 예산 설정 의도인 게 아니다. 금액 + 결정 표현(진행/시작/정하다/
+    설정하다 계열)도 같은 의도로 인식하도록 _BUDGET_DECISION_WORDS를 추가했다."""
+    phrasings = [
+        "나는 일단 200만원으로 진행해볼래",
+        "200만원으로 시작할래",
+        "200만원으로 정할래",
+        "200만원으로 설정할래",
+    ]
+    for q in phrasings:
+        matched = agent.route_question(q)
+        assert "plan_agent" in matched, f"예산 결정 표현이 plan_agent에 안 걸림: {q!r}"
+
+
+def test_amount_without_recurring_or_decision_intent_still_does_not_reach_plan_agent():
+    """예산 결정 표현 추가가 "금액이 들어간 모든 문장"으로 번지지 않았는지 확인 — 결정 어미도
+    반복 주기 단어도 없는 순수 조회/계산 질문은 여전히 plan_agent에 매칭되면 안 된다."""
+    matched = agent.route_question("BTC 1만원이면 얼마나 살 수 있어?")
+    assert "plan_agent" not in matched, "결정 의사 없는 금액 계산 질문인데 plan_agent가 매칭됨"

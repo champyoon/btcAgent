@@ -47,7 +47,7 @@ import tools as domain_tools
 from price_history import KST
 from datetime import datetime
 
-MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"  # 2026-09-17: 4개 후보(haiku-4-5/sonnet-4-6/nova-pro/nova-lite) 동일 질문 비교 후 확정 채택. 근거는 evaluation/model_comparison_report.md, CLAUDE.md "모델 선정" 참고 — 임시 대체가 아니라 최종 선택.
+MODEL_ID = "global.anthropic.claude-haiku-4-5-20251001-v1:0"  # 2026-09-17: 4개 후보(haiku-4-5/sonnet-4-6/nova-pro/nova-lite) 동일 질문 비교 후 확정 채택(모델 자체는 그대로). 근거는 evaluation/model_comparison_report.md, CLAUDE.md "모델 선정" 참고 — 임시 대체가 아니라 최종 선택. 2026-09-19: "us." 리전 프로파일이 ServiceUnavailableException으로 막혀 같은 모델의 "global." 리전 프로파일로 전환(모델 교체 아님 — 버전 문자열 claude-haiku-4-5-20251001-v1:0은 동일, 라우팅 프리픽스만 변경).
 # 이 계정에서 실제로 쓸 수 있는 다른 모델 목록·바꾸는 이유는 CLAUDE.md "모델 교체" 절 참고.
 REGION = "us-east-1"
 MAX_STEPS = 4  # Day3의 MAX_TOOL_CALLS와 같은 취지 — 순환이 무한히 돌지 않게
@@ -149,7 +149,14 @@ def _rsi_desc(v: float | None) -> str:
 def _dd_desc(d: dict | None) -> str:
     if d is None:
         return "계산 불가(구간 내 데이터 부족)"
-    return f"{d['pct']:.2f}%({d['start_date']}~{d['end_date']} 고점 {d['high']:,.0f}원 대비)"
+    # 2026-09-19 수정: "(구간시작~구간종료 고점 X원 대비)" 형태는 실사용 중 발견된 실제 결함의
+    # 원인이었다 — 최고가가 찍힌 실제 날짜를 안 알려주고 구간 범위만 보여주니, 답변을 만드는 쪽이
+    # 구간 시작일을 고점 발생일로 잘못 짐작해 "작년 9월 17일 고점" 같은 틀린 날짜를 답변에 넣었다
+    # (실제 고점은 그 구간 안 다른 날짜였음). 고점 발생일(high_date)을 구간 범위와 분리해 명시한다.
+    return (
+        f"{d['pct']:.2f}%(조회 구간 {d['start_date']}~{d['end_date']} 중 최고가 "
+        f"{d['high']:,.0f}원은 {d['high_date']}에 기록, 그 대비)"
+    )
 
 
 def _indicators_summary(records: list[dict]) -> str:
@@ -539,7 +546,15 @@ _AGENT_SYSTEM_PROMPTS = {
         "중요 — 데이터가 최신인지 의심하거나('아직 안 들어온 것 같은데') 오래된 데이터라도 계산해 "
         "달라는 질문에는, 되묻지 말고 먼저 get_indicators를 호출하세요 — 데이터가 실제로 오래됐다면 "
         "도구 자체가 확인을 요청하는 안내를 돌려줍니다. 어떤 지표인지 되묻는 것보다 일단 시도해보는 "
-        "편이 낫습니다."
+        "편이 낫습니다.\n\n"
+        "중요 — '지금 매수하기 좋은 시기야?'/'지금 사도 될까?'처럼 예/아니오 판정을 요구하는 질문 "
+        "(2026-09-19 발견 — 이전엔 라우팅이 안 걸려 무조건 거절됐습니다): 이런 질문에도 '예/아니오'로 "
+        "단정하지 마세요 — 이 서비스는 여러 지표를 합쳐 하나의 매수 등급을 내는 기능을 의도적으로 "
+        "제공하지 않습니다(과거에 있었다가 폐기된 기능입니다). 대신 get_indicators를 호출해 RSI·"
+        "200일 이동평균 괴리율·기간별 드로다운의 실제 값과 개별 의미를 알려주고, '이 지표들을 "
+        "종합해 지금이 적기라고 판정해드리지는 않습니다'라고 명확히 안내하세요. 사용자가 이미 전략을"
+        "선택해뒀다면, 그 전략의 조건 충족 여부는 plan_agent가 별도로 확인해줄 수 있다는 점만 "
+        "짧게 덧붙이고, 그 판정 자체를 당신이 대신 내리지 마세요."
     ),
     "plan_agent": (
         "당신은 이번 달 예산·전략 계획 담당 Agent입니다. get_month_status로 현재 상태를 확인하고, "
@@ -569,8 +584,11 @@ _AGENT_SYSTEM_PROMPTS = {
         "당신은 상태 조회·백테스트·전략 선택 결과만 책임지세요.\n\n"
         "중요 — set_monthly_budget은 호출한다고 바로 반영되지 않고 제안만 만듭니다(승인 없이 즉시 "
         "반영되던 이전 방식에서 2026-09-18 변경) — 이 도구 자체가 이미 확인을 기다리는 '제안' "
-        "단계이므로, **'매달 200만원씩 투자할래'처럼 금액과 시작 의사가 명확한 지시라면 되묻지 말고 "
-        "바로 이 도구를 호출하세요.** 도구가 만든 제안에 대한 실제 동의 여부는 사용자가 별도로 "
+        "단계이므로, **금액과 결정 의사가 명확한 지시라면 되묻지 말고 바로 이 도구를 호출하세요.** "
+        "이 도구는 원래 '이번 달 예산'을 다루는 것이라 '매달 200만원씩 투자할래'처럼 매번 반복 "
+        "주기를 언급할 필요는 없습니다 — 백테스트 결과를 본 뒤 '나는 일단 200만원으로 진행해볼래'/ "
+        "'200만원으로 시작할래'/'200만원으로 정할래'처럼 금액 + 결정 표현만으로도 충분히 명확한 "
+        "지시입니다. 도구가 만든 제안에 대한 실제 동의 여부는 사용자가 별도로 "
         "/confirm_budget_change로 표시하니, 당신이 도구 호출 전에 자연어로 '진행할까요?'라고 먼저 "
         "되물을 필요가 없습니다 — 그렇게 하면 제안 자체가 생성되지 않아 사용자가 확인할 대상(토큰)이 "
         "없어져 버립니다. 다음 경우에만 호출하지 말고 말로 답하세요(단, 설명을 생략하고 '설정할까요?' "
@@ -673,8 +691,14 @@ _AGENT_KEYWORDS: dict[str, list[str]] = {
         "얼마", "급등", "급락", "price", "indicator",
         # 실사용 중 발견(2026-09-17, evaluation #15): "데이터가 아직 안 들어온 것 같은데 그래도
         # 계산해줘"처럼 지표 계산/신선도를 묻는 질문인데 위 키워드를 하나도 안 써서 route_question이
-        # 아무 Agent도 못 찾아 도메인 밖 취급하던 것을 발견했다.
+        # 아무 Agent도 못 걸려 도메인 밖 취급하던 것을 발견했다.
         "계산",
+        # 실사용 중 발견(2026-09-19): "현재 btc를 매수하기에 좋은시기인지 알려줘"가 위 키워드를
+        # 하나도 안 써서 route_question이 아무 Agent도 못 찾아 도메인 밖으로 거절됐다. 이 서비스는
+        # 종합 매수 판정을 의도적으로 제공하지 않지만(SPEC §3-1, assess_dca_signal 폐기 확정), 그건
+        # "예/아니오로 답하지 않는다"는 뜻이지 "질문 자체를 거절한다"는 뜻이 아니다 — price_agent가
+        # 지표 값+의미로 답하고 판정만 거절해야 한다(프롬프트 참고).
+        "매수하기", "매수 타이밍", "살 때", "사기 좋은",
     ],
     "plan_agent": [
         "예산", "남은 예산", "이번 달", "이번달", "전략", "백테스트", "시뮬레이션", "비교",
@@ -745,6 +769,17 @@ _KRW_AMOUNT_RE = re.compile(r"\d[\d,]*\s*만?\s*원")
 # 테스트에서 "만원" 단독 키워드가 이 경우까지 잘못 끌어들이는 것을 발견해 조합 조건으로 좁혔다).
 _RECURRING_CADENCE_WORDS = ("매달", "한 달에", "한달에", "매월")
 
+# 실사용 중 발견(2026-09-19): 백테스트 결과를 본 뒤 "나는 일단 200만원으로 진행해볼래"처럼 금액을
+# 결정하는 말인데 "매달"/"한 달에" 같은 반복 주기 단어를 안 써서 위 _RECURRING_CADENCE_WORDS 조합에
+# 안 걸리고 route_question이 빈 목록을 반환했다 — set_monthly_budget은 애초에 "이번 달 예산"을
+# 다루는 도구라 매번 "매달"을 반복해야만 예산 설정 의도인 게 아니다. 금액 + "이 금액으로 결정한다"는
+# 의사표현(진행/시작/정하다/설정하다 계열)도 같은 의도로 본다 — 순수 조회/계산 질문("~하면 얼마나
+# 살 수 있어?")에는 이런 결정 어미가 안 붙으므로 오탐 위험이 낮다.
+_BUDGET_DECISION_WORDS = (
+    "진행할래", "진행해볼래", "진행하고 싶어", "진행하고싶어",
+    "시작할래", "시작해볼래", "정할래", "설정할래",
+)
+
 
 def route_question(question: str) -> list[str]:
     """질문을 읽고 어느 전문 Agent로 보낼지 LLM 없이 결정적으로 고릅니다.
@@ -753,7 +788,14 @@ def route_question(question: str) -> list[str]:
     """
     q = (question or "").lower()
     matched = [name for name, kws in _AGENT_KEYWORDS.items() if any(kw.lower() in q for kw in kws)]
-    if "plan_agent" not in matched and _KRW_AMOUNT_RE.search(q) and any(w in q for w in _RECURRING_CADENCE_WORDS):
+    if (
+        "plan_agent" not in matched
+        and _KRW_AMOUNT_RE.search(q)
+        and (
+            any(w in q for w in _RECURRING_CADENCE_WORDS)
+            or any(w in q for w in _BUDGET_DECISION_WORDS)
+        )
+    ):
         matched.append("plan_agent")
     return matched
 

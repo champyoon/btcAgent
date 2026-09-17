@@ -8,22 +8,28 @@ A FastAPI service — **BTC DCA Agent** — that helps a single user run a month
 compare three purchase strategies (decline-day / biweekly / RSI) against a 48-month backtest, track
 real (self-reported) buy/watch records and remaining budget, and answer questions via a LangGraph
 multi-agent Supervisor backed by Amazon Bedrock (Claude). **`src/agent.py:MODEL_ID` is
-`us.anthropic.claude-haiku-4-5-20251001-v1:0`** — this is the final, deliberately chosen submission
-model (2026-09-17), not a temporary stand-in. It was picked after comparing 4 real candidates
-(haiku-4-5/sonnet-4-6/nova-pro/nova-lite) on the same 3 representative questions under the same
-isolated state; see `evaluation/model_comparison_report.md` for the full evidence and §"모델 선정" below
-for the summary. Sonnet 4.5/4.6 were both ruled out for this account specifically because their daily
-Bedrock token quota is repeatedly exhausted (`ThrottlingException: Too many tokens per day`), not because
-of response quality — most of this file's "How this was verified" live-conversation testing was
-originally run against Sonnet 4.5 before that switch; where a section is Sonnet-specific it's labeled.
+`global.anthropic.claude-haiku-4-5-20251001-v1:0`** — Haiku 4.5 is the final, deliberately chosen
+submission model (2026-09-17), not a temporary stand-in; the `global.` prefix is a 2026-09-19 region-
+routing switch, not a model change (the `us.` inference profile started failing with
+`ServiceUnavailableException`, the `global.` profile for the exact same model version works). It was
+picked after comparing 4 real candidates (haiku-4-5/sonnet-4-6/nova-pro/nova-lite) on the same 3
+representative questions under the same isolated state; see `evaluation/model_comparison_report.md` for
+the full evidence and §"모델 선정" below for the summary. Sonnet 4.5/4.6 were both ruled out for this
+account specifically because their daily Bedrock token quota is repeatedly exhausted
+(`ThrottlingException: Too many tokens per day`), not because of response quality — most of this file's
+"How this was verified" live-conversation testing was originally run against Sonnet 4.5 before that
+switch; where a section is Sonnet-specific it's labeled.
 `src/retriever.py` has its own separate `MODEL_ID` constant for `build_rag_chain()`, but that function is
 currently unused (`agent.py`'s `retrieve_docs` tool calls `retriever.search_docs()` directly, not the RAG
 chain) — don't bother changing it unless that changes.
 
 ## 모델 선정 (2026-09-17 확정)
 
-`src/agent.py`의 `MODEL_ID`는 **`us.anthropic.claude-haiku-4-5-20251001-v1:0`로 확정**했다. 근거는
-`evaluation/model_comparison_report.md`(4개 후보를 동일 질문 3개·동일 격리 상태로 비교) — 요약:
+`src/agent.py`의 `MODEL_ID`는 **Haiku 4.5로 확정**했다(2026-09-19부터
+`global.anthropic.claude-haiku-4-5-20251001-v1:0` 프로파일 사용 — `us.` 프로파일이
+`ServiceUnavailableException`으로 막혀 같은 모델의 리전 프로파일만 전환, 모델 자체는 그대로).
+근거는 `evaluation/model_comparison_report.md`(4개 후보를 동일 질문 3개·동일 격리 상태로 비교) —
+요약:
 
 **모델 정책(2026-09-19 명확화)**: Haiku 4.5는 이 시점 **채택된** 제출 모델이지, 유일하게 허용된
 모델이거나 다른 모델 사용을 금지하는 규칙이 아니다. 다른 모델(Nova 등)로 스모크 테스트·비교를
@@ -35,7 +41,7 @@ chain) — don't bother changing it unless that changes.
 
 | 모델 ID | 이 계정에서의 상태 | 비교 결과 |
 |---|---|---|
-| `us.anthropic.claude-haiku-4-5-20251001-v1:0` | **채택(제출용)**, 정상 동작 | 3/3 질문 결함 없이 통과, 역할 구분·근거 제시가 가장 정확 |
+| `global.anthropic.claude-haiku-4-5-20251001-v1:0` | **채택(제출용, 2026-09-19부터 이 리전 프로파일 사용)**, 정상 동작 | 3/3 질문 결함 없이 통과, 역할 구분·근거 제시가 가장 정확. 같은 모델의 `us.` 프로파일이 `ServiceUnavailableException`으로 막혀 전환 |
 | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | **미평가**(일일 토큰 쿼터 상시 소진, `ThrottlingException`) | 품질 문제가 아니라 쿼터 소진으로 응답 자체를 못 받아 이 계정에서 배제 |
 | `us.anthropic.claude-sonnet-4-6` | **미평가**(동일 쿼터 소진) | 비교 실행 3문항 전부 응답을 받지 못함 — 품질 문제 아님 |
 | `us.amazon.nova-pro-v1:0` | 정상 동작(도구 호출 포함, 확인 완료) | 3/3 통과하고 haiku보다 빠르지만 일부 응답이 짧고 설명력이 떨어짐 — 차선책 |
@@ -77,7 +83,7 @@ curl -X POST http://localhost:8000/approve -H "Content-Type: application/json" \
 curl -X POST http://localhost:8000/reject -H "Content-Type: application/json" \
   -d '{"approval_id": "..."}'
 
-# Deterministic calculation tests (no AWS needed, no LLM calls) — 136/136 as of 2026-09-19
+# Deterministic calculation tests (no AWS needed, no LLM calls) — 141/141 as of 2026-09-19
 python -m pytest tests/ -v
 
 # Evaluation (real Bedrock/API calls — cost incurred, needs .env; CSV/tool names now match current
@@ -548,6 +554,75 @@ Key invariants to preserve when touching this code:
   reported the existing state via `get_month_status` alone, again with zero file mutation. **Nova-pro
   passing is not a Haiku verification** — Haiku 4.5 remains untested here, daily quota still exhausted,
   no further retries per the same standing instruction as above.
+- **`compute_drawdown()` returns the actual date its `high` occurred on (`high_date`), not just the
+  window bounds — found via a real Haiku 4.5 response, the first genuine submission-model verification
+  this session got to run** (2026-09-19). The `us.` Haiku profile started failing with
+  `ServiceUnavailableException`; switching to the `global.` profile for the same model version (see the
+  intro above) finally let live Haiku answers be checked directly, and the very first one turned up a
+  real bug: for "현재 btc 지표 알려줘" Haiku said the 1-year/4-year drawdown peaks were "작년 9월
+  17일"/"4년 전" and the 1-month peak was "8월 18일" — all three are wrong, and all three exactly match
+  each window's *start* date rather than the real peak day (verified by scanning the actual price cache:
+  the true peaks were 2025-10-09 for both the 1-year and 4-year windows, and 2026-08-28 for the 1-month
+  window). Root cause: `compute_drawdown()` computed `high = max(c["high"] for c in window)` but threw
+  away which candle produced it, and `agent.py:_dd_desc()` then phrased the result as "(구간시작~구간종료
+  고점 X원 대비)" — a window range sitting right next to a peak value, with nothing distinguishing "this
+  is the window I searched" from "this is when the peak happened." Without the actual date to work with,
+  the model filled the gap with the window's start date, which reads plausibly but is wrong. This is the
+  same failure shape as the "2주마다"/"자동 매수" case above (correct calculation, ambiguous tool output,
+  wrong model paraphrase) — not a calculation bug. Fixed by having `compute_drawdown()` track the peak
+  candle's own `date_kst` as `high_date` and returning it, and rewriting `_dd_desc()` to state the window
+  range and the peak date as two distinct facts ("조회 구간 X~Y 중 최고가 Z원은 W에 기록"). Verified
+  without a live call via `tests/test_data_freshness.py` (peak forced to a mid-window day, distinct from
+  both `start_date` and `end_date`, to make sure `high_date` isn't accidentally right by construction),
+  and verified live by re-running the exact reported question through the actual submission model
+  (Haiku 4.5, `global.` profile) — the tool output and the final answer both now state the correct dates
+  for all three windows. Full transcripts: REPORT.md §17.
+- **A buy-timing verdict question ("현재 btc를 매수하기에 좋은시기인지 알려줘") is in scope for
+  price_agent to *answer with indicator values*, even though this service deliberately never gives a
+  composite yes/no verdict** (found via manual Swagger testing, 2026-09-19). `route_question` returned
+  `[]` for it — no keyword covered "매수하기"/"매수 타이밍"/"살 때"/"사기 좋은" — so the whole question
+  was rejected as out-of-scope, when the correct behavior is to answer it with RSI/MA-deviation/drawdown
+  values and their individual meaning, then explicitly decline the composite judgment (SPEC §3-1's
+  `assess_dca_signal` deprecation means "don't answer yes/no," not "don't answer the question at all" —
+  don't conflate the two). Fixed by adding those four phrasings to `price_agent`'s keywords (sell-timing
+  phrasing was deliberately left out — out of scope, this service is buy-only) and adding a paragraph to
+  `price_agent`'s system prompt instructing it to give `get_indicators` values+meaning, explicitly state
+  it doesn't produce a combined "적기" judgment, and mention that `plan_agent` can separately check
+  whether the user's own selected strategy's condition has fired. Verified via `tests/test_routing.py`
+  (`test_buy_timing_verdict_questions_reach_price_agent`, 4 phrasings + 2 unrelated-"시작"-style controls
+  still rejected) and live against the actual submission model (Haiku 4.5, `global.` profile,
+  2026-09-17T17:16:36+09:00 KST): `agents_used=['price_agent']`, only `get_btc_price`/`get_indicators`
+  were called (no verdict-producing tool exists to call), and the final answer stated indicator values
+  then explicitly declined a combined "적기" judgment while pointing to the strategy-condition check.
+  Full transcript: REPORT.md §18.
+- **A budget-decision sentence without a recurring-cadence word ("나는 일단 200만원으로 진행해볼래",
+  after seeing the 48-month backtest) also has to reach `plan_agent`, not just "매달 X원씩" phrasing**
+  (found via manual Swagger testing, 2026-09-19). §13-1's fix required an amount (`_KRW_AMOUNT_RE`) to
+  co-occur with a recurring-cadence word (`_RECURRING_CADENCE_WORDS`: 매달/한 달에/매월) specifically to
+  stop a bare "만원" from wrongly pulling in pure quantity questions — but `set_monthly_budget` is
+  inherently a "this month's budget" tool, so a user doesn't have to say "매달" every time to mean it;
+  "진행할래"/"시작할래"/"정할래"/"설정할래"-style decision endings are an equally valid signal of the
+  same intent and none of them appeared in the cadence-word list, so `route_question` returned `[]` for
+  this exact reported sentence. Fixed by adding `_BUDGET_DECISION_WORDS` (진행할래/진행해볼래/진행하고
+  싶어/진행하고싶어/시작할래/시작해볼래/정할래/설정할래) and widening the condition to "amount +
+  (cadence word OR decision word)" — a pure calculation question like "BTC 1만원이면 얼마나 살 수
+  있어?" carries neither a cadence word nor a decision ending, so §13-1's original false-positive fix
+  still holds (re-verified, not just assumed). Also generalized `plan_agent`'s system prompt, which used
+  to hold up "매달 200만원씩 투자할래" as *the* example of an unambiguous instruction — that could bias
+  the model toward expecting cadence phrasing specifically; now states explicitly that the tool is
+  inherently monthly so cadence words don't need repeating, with the reported decision-style sentence
+  added as its own example. Verified via `tests/test_routing.py`
+  (`test_budget_decision_without_recurring_cadence_word_reaches_plan_agent`: 4 decision-style phrasings
+  incl. the exact reported sentence;
+  `test_amount_without_recurring_or_decision_intent_still_does_not_reach_plan_agent`: the §13-1 pure
+  quantity-question case still doesn't match) and live against the actual submission model (Haiku 4.5,
+  `global.` profile, isolated `BTC_AGENT_DATA_DIR`, 2026-09-17T17:33:10+09:00 KST): `agents_used=
+  ['plan_agent']`, `set_monthly_budget(amount_krw=2000000)` was called correctly, a real
+  `confirmation_token` came back in `budget_change_needs_confirmation`, the isolated `month_state.json`
+  was confirmed **not yet written** (propose-only, per §4-2), and the final answer stated the amount/
+  effective month/unsaved status/confirm-cancel paths exactly once via the structured block (§15-7's
+  exclusion dropped `plan_agent`'s own low-content text, judged `keep=false` by `judge_output`). Full
+  transcript: REPORT.md §19.
 - **`plan_agent`/`research_agent` system prompts each know what they're *not* authoritative on** —
   `research_agent` is told not to assert the user's actual current state (budget/strategy/plan-started)
   from docs alone; `plan_agent` is told not to explain a strategy's exact trigger *condition* from

@@ -117,7 +117,8 @@ def compute_drawdown(
         window.append(c)
         cursor += timedelta(days=1)
 
-    high = max(c["high"] for c in window)
+    high_candle = max(window, key=lambda c: c["high"])
+    high = high_candle["high"]
     if high == 0:
         return None
     return {
@@ -125,5 +126,12 @@ def compute_drawdown(
         "start_date": expected_start.isoformat(),
         "end_date": end_date.isoformat(),
         "high": high,
+        # 2026-09-19 추가: 실사용 중 발견 — 이전에는 구간 내 최고가(high)만 반환하고 그 최고가가
+        # "언제" 찍혔는지는 버리고 있었다. 그러자 이 값을 답변 문구로 옮기는 쪽(agent.py:_dd_desc)이
+        # "(구간 시작일~종료일 고점 X원 대비)"처럼 구간 범위만 보여줬는데, 실제 Haiku 응답에서
+        # "1년: 179,869,000원 대비(작년 9월 17일 고점)"처럼 구간 시작일을 고점 발생일로 잘못
+        # 서술하는 결과가 나왔다 — 실제 고점은 그 약 3주 뒤(2025-10-09)였다. 최고가가 찍힌 실제
+        # 날짜를 도구 결과 자체에 포함시켜, 답변을 만드는 쪽이 추측하지 않고 이 값을 그대로 쓰게 한다.
+        "high_date": high_candle["date_kst"],
         "close": end["close"],
     }

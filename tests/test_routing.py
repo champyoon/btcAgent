@@ -116,6 +116,22 @@ def test_buy_timing_verdict_questions_reach_price_agent():
         assert "price_agent" in matched, f"매수 시기 질문이 price_agent에 안 걸림: {q!r}"
 
 
+def test_buy_timing_phrasing_variants_not_covered_by_first_fix_reach_price_agent():
+    """수동 테스트 중 추가 발견(2026-09-19): "오늘 btc 사기에 어때?"가
+    test_buy_timing_verdict_questions_reach_price_agent에서 고친 표현("사기 좋은" 등)과 문자열이
+    안 맞아 여전히 route=[]로 거절됐다 — 같은 매수 시기 질문의 표현 변형이다. "사기에 어때"/"살까"/
+    "사도 될까"/"사도 괜찮을까"를 추가로 매칭시킨다."""
+    phrasings = [
+        "오늘 btc 사기에 어때?",
+        "지금 살까?",
+        "지금 사도 될까?",
+        "지금 사도 괜찮을까?",
+    ]
+    for q in phrasings:
+        matched = agent.route_question(q)
+        assert "price_agent" in matched, f"매수 시기 질문 변형이 price_agent에 안 걸림: {q!r}"
+
+
 def test_budget_decision_without_recurring_cadence_word_reaches_plan_agent():
     """수동 테스트 중 발견(2026-09-19): 백테스트 결과를 본 뒤 "나는 일단 200만원으로 진행해볼래"가
     "매달"/"한 달에" 같은 반복 주기 단어를 안 써서 _RECURRING_CADENCE_WORDS 조합에 안 걸리고
@@ -138,3 +154,20 @@ def test_amount_without_recurring_or_decision_intent_still_does_not_reach_plan_a
     반복 주기 단어도 없는 순수 조회/계산 질문은 여전히 plan_agent에 매칭되면 안 된다."""
     matched = agent.route_question("BTC 1만원이면 얼마나 살 수 있어?")
     assert "plan_agent" not in matched, "결정 의사 없는 금액 계산 질문인데 plan_agent가 매칭됨"
+
+
+def test_budget_decision_plain_declarative_endings_reach_plan_agent():
+    """수동 테스트 중 추가 발견(2026-09-19): "100만원으로 시작한다"가(예산 안내를 듣고 답한
+    문장으로 보임) test_budget_decision_without_recurring_cadence_word_reaches_plan_agent에서 고친
+    "~ㄹ래"/"~고 싶어" 어미와 안 맞아 여전히 route=[]로 거절됐다 — 매수 시기 표현(§18-2)과 같은
+    종류의 한계다. 평서형("~ㄴ다")·구어체 진행형("~할게")·과거형("~했어") 종결을 추가로
+    포괄한다."""
+    phrasings = [
+        "100만원으로 시작한다",
+        "100만원으로 진행한다",
+        "100만원으로 진행할게",
+        "100만원으로 정했어",
+    ]
+    for q in phrasings:
+        matched = agent.route_question(q)
+        assert "plan_agent" in matched, f"예산 결정 평서형 표현이 plan_agent에 안 걸림: {q!r}"

@@ -83,7 +83,7 @@ curl -X POST http://localhost:8000/approve -H "Content-Type: application/json" \
 curl -X POST http://localhost:8000/reject -H "Content-Type: application/json" \
   -d '{"approval_id": "..."}'
 
-# Deterministic calculation tests (no AWS needed, no LLM calls) — 141/141 as of 2026-09-19
+# Deterministic calculation tests (no AWS needed, no LLM calls) — 143/143 as of 2026-09-19
 python -m pytest tests/ -v
 
 # Evaluation (real Bedrock/API calls — cost incurred, needs .env; CSV/tool names now match current
@@ -595,6 +595,20 @@ Key invariants to preserve when touching this code:
   were called (no verdict-producing tool exists to call), and the final answer stated indicator values
   then explicitly declined a combined "적기" judgment while pointing to the strategy-condition check.
   Full transcript: REPORT.md §18.
+- **Buy-timing questions have effectively unlimited phrasing — the first keyword fix (above) doesn't
+  cover every variant, and a second one already turned up** (found via manual Swagger testing,
+  2026-09-19, same day as the first fix). "오늘 btc 사기에 어때?" still returned `route=[]` because
+  none of the four phrasings added for the first fix ("매수하기"/"매수 타이밍"/"살 때"/"사기 좋은")
+  string-match "사기에 어때" — this is not a new bug class, it's the same one recurring because
+  keyword-list matching can only ever cover phrasings someone has actually reported. Fixed by adding
+  "사기에 어때"/"살까"/"사도 될까"/"사도 괜찮을까" to `price_agent`'s keywords. Verified via
+  `tests/test_routing.py::test_buy_timing_phrasing_variants_not_covered_by_first_fix_reach_price_agent`
+  and live against Haiku 4.5 (`global.` profile, 2026-09-17T17:44:15+09:00 KST): routed to
+  `price_agent`, gave RSI(50.80)/MA200-deviation(+1.94%)/drawdown values with meaning, then explicitly
+  declined a combined verdict. **Known, accepted limitation, not fully closed**: don't assume the next
+  reported phrasing variant of this same question won't need its own keyword addition too — this is a
+  structural property of keyword-list routing (documented, not a promise to eventually enumerate every
+  case). Full transcript: REPORT.md §18-2.
 - **A budget-decision sentence without a recurring-cadence word ("나는 일단 200만원으로 진행해볼래",
   after seeing the 48-month backtest) also has to reach `plan_agent`, not just "매달 X원씩" phrasing**
   (found via manual Swagger testing, 2026-09-19). §13-1's fix required an amount (`_KRW_AMOUNT_RE`) to
@@ -623,6 +637,22 @@ Key invariants to preserve when touching this code:
   effective month/unsaved status/confirm-cancel paths exactly once via the structured block (§15-7's
   exclusion dropped `plan_agent`'s own low-content text, judged `keep=false` by `judge_output`). Full
   transcript: REPORT.md §19.
+- **Budget-decision phrasing has the same open-ended-variants problem as buy-timing phrasing (§18-2) —
+  a second decision-ending gap turned up the same day** (found via manual Swagger testing, 2026-09-19).
+  "100만원으로 시작한다" (likely a direct answer to a prior turn that asked for the amount — this API
+  has no memory of that turn, so routing has to work from this sentence alone) still returned
+  `route=[]`: the §19 fix only covered casual intent endings ("~ㄹ래"/"~고 싶어"), not the plain
+  declarative "~ㄴ다" ending. Fixed by adding 12 more literal words to `_BUDGET_DECISION_WORDS` —
+  declarative (진행한다/시작한다/정한다/설정한다), casual-progressive (진행할게/시작할게/정할게/
+  설정할게), and past-tense (진행했어/시작했어/정했어/설정했어) endings for the same four stems.
+  Verified via `tests/test_routing.py::test_budget_decision_plain_declarative_endings_reach_plan_agent`
+  and live against Haiku 4.5 (`global.` profile, isolated `BTC_AGENT_DATA_DIR`,
+  2026-09-17T17:50:59+09:00 KST): `agents_used=['plan_agent']`, `set_monthly_budget(amount_krw=1000000)`
+  called correctly, a real `confirmation_token` came back, `month_state.json` confirmed not yet
+  written. **Same accepted limitation as §18-2, stated again so it doesn't read as a one-off**: Korean
+  decision-verb endings are effectively unbounded — don't treat this fix (or the next one) as having
+  closed the category, just as having covered what's been reported so far. Full transcript: REPORT.md
+  §19-2.
 - **`plan_agent`/`research_agent` system prompts each know what they're *not* authoritative on** —
   `research_agent` is told not to assert the user's actual current state (budget/strategy/plan-started)
   from docs alone; `plan_agent` is told not to explain a strategy's exact trigger *condition* from

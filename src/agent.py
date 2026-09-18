@@ -745,7 +745,12 @@ _AGENT_SYSTEM_PROMPTS = {
         "그리고 BTC 지금 가격도 알려줘'처럼 가격 질문에 개인 사용액·예산 질문이 함께 오면, 당신은 "
         "가격·지표 부분만 답하세요 — 사용액·예산 부분은 plan_agent가 같은 응답 안에서 이미 답합니다. "
         "'지출 내역은 다른 부서에 문의하세요'/'그건 제 담당이 아닙니다' 같은 거절 문장을 덧붙이지 "
-        "마세요 — 답을 안 하는 게 아니라 이미 다른 Agent가 그 부분을 답하고 있는 것뿐입니다."
+        "마세요 — 답을 안 하는 게 아니라 이미 다른 Agent가 그 부분을 답하고 있는 것뿐입니다.\n\n"
+        "중요 — 'BTC 분석해줘'/'BTC 현재 상황 알려줘'처럼 뭉뚱그린 분석 요청도(2026-09-20 재현) "
+        "get_indicators로 답하세요 — '분석'이라는 단어가 종합 판정을 요구하는 것처럼 들려도, "
+        "이 서비스의 답은 항상 'RSI·이동평균·DD·MDD 각각의 값과 의미'입니다. 이 요청에서도 "
+        "종합 매수 등급이나 '사도 된다/기다려라' 같은 판단을 내리지 마세요 — 위 문단과 동일한 "
+        "원칙입니다."
     ),
     "plan_agent": (
         "당신은 이번 달 예산·전략 계획 담당 Agent입니다. get_month_status로 현재 상태를 확인하고, "
@@ -1011,6 +1016,10 @@ _AGENT_KEYWORDS: dict[str, list[str]] = {
         # 것과도 문자열이 안 맞아(예: "사기 좋은"과 다름) 여전히 route=[]로 거절됐다 — 같은 매수
         # 시기 질문의 표현 변형이다. "사기에 어때"/"살까"/"사도 될까"/"사도 괜찮을까"를 추가한다.
         "사기에 어때", "살까", "사도 될까", "사도 괜찮을까",
+        # 실사용 UI 신고(2026-09-20, #5): "BTC 분석해줘"/"BTC 현재 상황 알려줘"가 위 키워드를
+        # 하나도 안 써서(같은 뜻인 "BTC 지표 알려줘"는 "지표" 덕에 이미 정상 동작) route=[]로
+        # 범위 밖 거절됐다 — "분석"/"현재 상황"도 결국 get_indicators가 답하는 것과 같은 요청이다.
+        "분석", "현재 상황", "상황 알려줘", "상황이 어때",
     ],
     "plan_agent": [
         "예산", "남은 예산", "이번 달", "이번달", "전략", "백테스트", "시뮬레이션", "비교",
@@ -1257,9 +1266,63 @@ _STRATEGY_DECISION_WORDS = (
 # 백테스트 등)로 이미 매칭됐다면 그대로 둔다 — "내 전략은 뭐고 RSI는 무슨 뜻이야?"처럼 복합
 # 질문은 "rsi"·"무슨 뜻" 둘 다 있어 영향받지 않는다.
 _MONTH_NUMBER_RE = re.compile(r"\d{1,2}\s*월")
-_PERSONAL_STATUS_CONTEXT_WORDS = ("내 ", "제 ", "저의 ", "이번 달", "이번달", "다음 달", "다음달")
+_PERSONAL_STATUS_CONTEXT_WORDS = (
+    "내 ", "제 ", "저의 ", "이번 달", "이번달", "다음 달", "다음달",
+    # 실사용 재현(2026-09-20): "현재 전략이 뭔지 알려주고, 매수 조건이 충족되었는지 확인해줘"는
+    # "내"/"제"/월 표현 어느 것도 안 써서 위 목록으로 개인 상태 문맥을 못 잡았다 — "현재 전략"/
+    # "지금 전략"도 "이번 달 전략"과 똑같이 "내가 지금 선택해둔 전략"을 묻는 개인 상태 표현이다.
+    "현재 전략", "지금 전략", "현재 선택", "지금 선택", "선택된 전략", "선택한 전략",
+)
 _STRATEGY_CONCEPT_QUERY_WORDS = (
     "무슨 뜻", "뜻이 뭐", "뭔 뜻", "정의가", "원리가", "조건이 뭐", "방식이 뭐", "어떻게 계산", "뭘 의미",
+)
+
+# 실사용 UI 신고(2026-09-20, #6): "BTC가 뭐야"/"비트코인이 뭐야"/"비트코인에 대해 설명해줘"가
+# research_agent(문서 data/docs/BTC.md 보유)의 어느 키워드에도 안 걸려 범위 밖으로 거절됐다 —
+# "DCA가 뭐야?"는 "dca"가 이미 키워드라 정상 동작하는데 "btc"/"비트코인"은 애초에 어떤 Agent의
+# 키워드 목록에도 없었다. 그렇다고 "btc"/"비트코인"을 research_agent에 단독 키워드로 추가하면
+# "오늘 50만원어치 BTC 매수했어"(ledger_agent 몫) 같은 문장까지 전부 research_agent를 끌어들이게
+# 된다 — "개념을 묻는 어미(뭐야/란/설명해줘)와 함께 있을 때만" 매칭하는 조합 규칙으로 좁힌다
+# (§22-1의 전략 선택 조합 규칙과 같은 설계).
+_BTC_CONCEPT_RE = re.compile(
+    r"(btc|비트코인)\s*(가|이|는|은)?\s*(뭐야|뭔가요|무엇|란\b|이란)"
+    r"|(btc|비트코인).{0,10}(설명해|소개해)"
+    r"|(설명해|소개해).{0,10}(btc|비트코인)",
+    re.IGNORECASE,
+)
+
+# 실사용 UI 신고(2026-09-20, #5): "안녕"/"넌 무슨일을 할수있니"가 어느 Agent 키워드에도 안 걸려
+# 다른 범위 밖 질문과 똑같이 "~에 대해서만 답할 수 있습니다"로 거절됐다. 인사·기능 소개 요청은
+# 특정 Agent가 아니라 서비스 전체에 대한 메타 질문이라 route_question의 일반 매칭 대상이 아니다 —
+# run()에서 agents가 비었을 때만 별도로 확인한다(정상적으로 어느 Agent에 걸리는 질문에 "안녕"이
+# 우연히 포함돼 있어도 이 분기를 타지 않는다). 띄어쓰기가 없는 구어체 표현("무슨일을할수있니")도
+# 흔해 각 어절 사이에 공백을 선택적으로 허용하는 정규식으로 잡는다.
+_GREETING_OR_CAPABILITY_RE = re.compile(
+    r"^\s*(안녕|하이|헬로)"  # 한글은 \b(단어 경계)가 음절 사이에서 작동하지 않아 접두 매칭으로 처리
+    r"|\b(hi|hello)\b"
+    r"|무슨\s*일을?\s*할\s*수\s*있"
+    r"|뭘\s*할\s*수\s*있"
+    r"|뭐\s*를?\s*할\s*수\s*있"
+    r"|어떤\s*(걸|것을?)\s*도와"
+    r"|무엇을\s*도와"
+    r"|(어떤|무슨)\s*도움"
+    r"|뭐\s*하는\s*서비스|뭘\s*하는\s*서비스"
+    r"|뭐\s*해주는|뭘\s*해주는"
+    r"|기능이\s*뭐",
+    re.IGNORECASE,
+)
+_CAPABILITY_INTRO_TEXT = (
+    "안녕하세요! 이 어시스턴트는 비트코인(BTC) DCA(분할 매수) 계획을 돕는 도우미입니다. "
+    "다음을 도와드릴 수 있어요:\n\n"
+    "- **예산·전략 계획**: 월 예산 설정, 세 가지 매수 전략(하락일/정기 분할/RSI) 선택·변경, "
+    "과거 48개월 백테스트 비교\n"
+    "- **시세·지표 조회**: 실시간 BTC 가격, RSI·200일 이동평균 괴리율·기간별 DD(현재 하락률)·"
+    "MDD(최대 낙폭)\n"
+    "- **매수 기록 관리**: 실제 매수·관망 기록, 이번 달 사용액·남은 예산 조회\n"
+    "- **개념 설명**: DCA·RSI 등 투자 개념과 이 서비스의 매수 규칙 설명\n\n"
+    "예시: \"이번 달 예산 얼마 남았어?\", \"BTC 지표 알려줘\", \"RSI 매수로 할게\", "
+    "\"오늘 50만원어치 매수했어\"\n\n"
+    "이 범위를 벗어난 질문(다른 코인, 실시간 알림, 자동매매 등)은 도와드릴 수 없어요."
 )
 
 
@@ -1302,9 +1365,11 @@ def route_question(question: str) -> list[str]:
         and any(w in q for w in _STRATEGY_DECISION_WORDS)
     ):
         matched.append("plan_agent")
+    if "research_agent" not in matched and _BTC_CONCEPT_RE.search(q):
+        matched.append("research_agent")
     if "research_agent" in matched:
         has_personal_context = bool(_MONTH_NUMBER_RE.search(q)) or any(w in q for w in _PERSONAL_STATUS_CONTEXT_WORDS)
-        has_concept_query = any(w in q for w in _STRATEGY_CONCEPT_QUERY_WORDS)
+        has_concept_query = any(w in q for w in _STRATEGY_CONCEPT_QUERY_WORDS) or bool(_BTC_CONCEPT_RE.search(q))
         if has_personal_context and not has_concept_query:
             other_research_keywords = [kw for kw in _AGENT_KEYWORDS["research_agent"] if kw != "전략"]
             if not any(kw.lower() in q for kw in other_research_keywords):
@@ -1681,6 +1746,21 @@ def build_supervisor(llm=None):
         agents = route_question(safe_question)
         trace.append({"step": "route", "input": safe_question, "output": agents})
         if not agents:
+            # 실사용 UI 신고(2026-09-20, #5): "안녕"/"넌 무슨일을 할수있니"처럼 인사·기능 소개
+            # 요청까지 다른 범위 밖 질문과 똑같은 "~에 대해서만 답할 수 있습니다" 한 줄로 거절돼,
+            # 처음 쓰는 사용자가 이 서비스로 뭘 할 수 있는지 전혀 감을 못 잡았다. 어느 Agent도
+            # 이 질문을 소유하지 않으므로(모든 Agent가 각자의 좁은 전문 영역만 담당) LLM 호출 없이
+            # 서버가 직접 고정된 소개 문구를 반환한다 — 매번 같은 정확한 소개가 보장되고, 이 흔한
+            # 첫 질문 하나에 불필요한 모델 호출 비용도 들지 않는다.
+            if _GREETING_OR_CAPABILITY_RE.search(safe_question):
+                return {
+                    "answer": _CAPABILITY_INTRO_TEXT,
+                    "narrative": _CAPABILITY_INTRO_TEXT,
+                    "contexts": [],
+                    "trace": trace,
+                    "agents_used": [],
+                    "approvals_needed": [],
+                }
             text = "이 어시스턴트는 BTC 예산·전략 계획·시세·지표·매수 기록에 대해서만 답할 수 있습니다."
             return {
                 "answer": text,

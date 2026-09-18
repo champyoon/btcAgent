@@ -83,11 +83,12 @@ curl -X POST http://localhost:8000/approve -H "Content-Type: application/json" \
 curl -X POST http://localhost:8000/reject -H "Content-Type: application/json" \
   -d '{"approval_id": "..."}'
 
-# Deterministic calculation tests (no AWS needed, no LLM calls) — 143/143 as of 2026-09-19
+# Deterministic calculation tests (no AWS needed, no LLM calls) — 250/250 as of 2026-09-20
+# UI-interaction tests (separate category, not counted above) — ui/tests/: 34/34 as of 2026-09-20
 python -m pytest tests/ -v
 
 # Evaluation (real Bedrock/API calls — cost incurred, needs .env; CSV/tool names now match current
-# tool set — see evaluation/round3_report.md for the full breakdown)
+# tool set — see evaluation/round2_report.md#legacy-round3 for the full breakdown)
 python evaluation/run_eval.py --round 3     # rule-based judge() — string/tool-call checks only
 python evaluation/llm_as_judge.py           # separate LLM-as-Judge — semantic/consistency grading
 python evaluation/run_ragas.py              # currently fails in this environment, see below
@@ -120,7 +121,7 @@ why `context_recall`/`context_precision` came back suspiciously at 0.00 the firs
 run. Fixed by remapping `_REFERENCES` to the current row IDs with text copied verbatim from what
 `retrieve_docs` actually returns for each question. Don't add a new RAG-eval CSV row without also
 checking whether it needs a `_REFERENCES` entry — a silently-skipped or silently-mismatched row won't
-raise anything, it'll just quietly corrupt the averages. See `evaluation/round4_report.md` §4 for the
+raise anything, it'll just quietly corrupt the averages. See `evaluation/round2_report.md#legacy-round4` §4 for the
 before/after numbers and the full question↔reference mapping table this script now prints on every run.
 
 ## Architecture
@@ -169,7 +170,7 @@ reference and a live value can't have one. Building this set surfaced one more r
 결과는 어떻게 해석해야 하는가?"/"월말 잔여 예산은 어떻게 처리되는가?" matched only `plan_agent`
 (which has no `retrieve_docs`), so `research_agent` — and therefore any document search — never fired;
 fixed by adding "백테스트"/"월말"/"잔여" to `research_agent`'s keywords. Full run (Haiku): 8/8 evaluated,
-0 errors, 0 NaN, context_recall 1.00 avg — see `evaluation/round5_report.md`. The result file
+0 errors, 0 NaN, context_recall 1.00 avg — see `evaluation/round2_report.md#legacy-round5`. The result file
 (`evaluation/rag_eval_results.json`) carries the question, reference, actual answer, retrieved contexts,
 all 4 scores, response/judge/embedding model, execution timestamp, git commit (+dirty flag), and a hash
 of the eval-set file — enough to tell later whether a given result set is still valid for the current
@@ -185,10 +186,17 @@ Also: `find_missing_dates(records, start, end)` is now wired into the actual cal
   fool. This range-gap check is intentionally independent of `proceed_with_stale_data` — that flag only
   waives "the latest candle isn't in yet," never a gap earlier in the required range. See REPORT.md §8.
 - `src/indicators.py` — `compute_rsi_series()` (Wilder's RMA, full SPEC §6-3 special-value table: both-
-  zero→50, gain-only→100, loss-only→0), `compute_ma_deviation_pct()`, `compute_drawdown()` (1-month/
-  1-year by day-count, 4-year by calendar-month arithmetic per SPEC §6-2 — *different* windowing rules,
-  don't conflate them; returns `None` on any gap in the window rather than stretching it). None of these
-  round internally (SPEC §6-5: rounding is display-only) — `agent.py`'s tool wrappers do the formatting.
+  zero→50, gain-only→100, loss-only→0), `compute_ma_deviation_pct()`, `compute_dd_mdd()` (SPEC §6-2,
+  **2026-09-20 policy change** — replaces the old `compute_drawdown()`: DD and MDD are now both
+  **close-based**, not high-based; `high` is never read by this function at all. Windows: 30 days/
+  365 days by day-count, 48 months by calendar-month arithmetic — *different* windowing rules, don't
+  conflate them; returns `None` on any gap in the window, or if the window can't be fully covered by
+  the supplied candles at all (not just an internal gap — insufficient total history is the same
+  `None`, deliberately not distinguished, since both mean "don't compute, don't guess"). Single pass:
+  tracks a running peak-close per day, DD is that running dd at the final day, MDD is the minimum
+  across all days — see its own "Key invariants" bullet below for why this is correct and the full
+  worked examples). None of these round internally (SPEC §6-5: rounding is display-only) — `agent.py`'s
+  tool wrappers do the formatting.
 - `src/strategy.py` — the three strategies' trigger conditions (SPEC §3), shared by `backtest.py` *and*
   `month_state.py` on purpose (SPEC's "live query and backtest use the same calc function" principle,
   stated for RSI in §6-4, applied here too) — a strategy's rule can't quietly drift between historical
@@ -223,11 +231,14 @@ Also: `find_missing_dates(records, start, end)` is now wired into the actual cal
   same-function races. Verified with real `threading.Thread` races (both same-function and
   cross-function) in `tests/test_approvals.py`, not just sequential re-calls.
 - `src/month_state.py` — SPEC §2/§4/§5 monthly plan state (`data/month_state.json`, gitignored):
-  plan-start month (mid-month signup ⇒ starts next month, exposed via `get_month_status()`'s
-  `plan_start_month` field so `agent.py`'s tool wrapper can always state "queried month" vs. "plan start
-  month" vs. "strategy selected in that month" as three distinct facts — added 2026-09-17 after finding
-  a worker response that blurred them together, see "How this was verified"), per-month budget history
-  (`set_monthly_budget` always schedules for *next* calendar month), per-month selected strategy + change
+  plan-start month, exposed via `get_month_status()`'s `plan_start_month` field so `agent.py`'s tool
+  wrapper can always state "queried month" vs. "plan start month" vs. "strategy selected in that month"
+  as three distinct facts (added 2026-09-17 after finding a worker response that blurred them together,
+  see "How this was verified"). **2026-09-20 policy change — mid-month signup can now start *this*
+  month, not just next month** (see its own Key Invariants bullet below for the full three-way
+  `initial`/`advance`/`change` model this introduced) — `set_monthly_budget` still always schedules an
+  ordinary *change* (plan already active) for *next* calendar month, that part of §4 didn't change.
+  Per-month selected strategy + change
   history, the three cutoffs (`biweekly_cutoff_passed` — 15th 09:00 KST, `month_end_cutoff_passed` — last
   day 00:00 KST, plus "plan not started yet"), and `evaluate_current_condition()` for §5's "missed
   signal" recompute (always re-derives from confirmed-only data; now also checks
@@ -253,13 +264,20 @@ Also: `find_missing_dates(records, start, end)` is now wired into the actual cal
 Request flow (`app.py` → `src/agent.py:build_supervisor`):
 
 ```
-POST /query {question, proceed_with_stale_data}
+POST /query {question, proceed_with_stale_data, awaiting_input_token?}
   → guardrails.input_guard   (blocks prompt-injection/secret-leak/jailbreak/approval-bypass attempts)
   → guardrails.mask_pii      (masks phone/email/resident-id/AWS keys/exchange API secrets)
+  → awaiting_input direct-resolution (2026-09-20, SPEC §2-3) — if awaiting_input_token matches a
+       pending entry in agent._PENDING_AWAITING_INPUT (single-use, popped regardless of outcome), the
+       message is checked for a KRW amount (_parse_krw_amount) BEFORE routing/LLM. A match short-
+       circuits straight to a budget proposal (agent._propose_budget) with NO LangGraph worker
+       invoked at all; no match falls through to normal routing (the token is still consumed, so
+       switching topics clears the "awaiting" state).
   → agent.route_question     (deterministic keyword routing, NO LLM call — src/agent.py:_AGENT_KEYWORDS)
   → one LangGraph worker per matched agent, each its own agent↔tools loop (MAX_STEPS=4):
        price_agent    (get_btc_price / get_indicators — values+meaning, no composite verdict, SPEC §3-1)
-       plan_agent     (get_month_status / set_monthly_budget / select_strategy / run_backtest)
+       plan_agent     (get_month_status / request_monthly_budget_amount / set_monthly_budget /
+                        select_strategy / run_backtest)
        research_agent (retrieve_docs → RAG over data/docs/*.md — SPEC §8's 8-file restructuring is done:
                         BTC.md/DCA.md/RSI.md/market_indicators.md/backtest_guide.md/service_rules.md
                         (new) + rewritten dca_strategy.md + unchanged risk_management.md; glossary.md
@@ -269,15 +287,21 @@ POST /query {question, proceed_with_stale_data}
   → per-call gate: guardrails.needs_approval(tool, args) — write/destructive tool_calls route to
        await_approval_node instead of executing (conditional graph edge, not a prompt instruction).
        That node calls approvals.create() to mint an approval_id and stores {tool, args} server-side —
-       the id (not raw tool/args) is what comes back in approvals_needed.
+       the id (not raw tool/args) is what comes back in approvals_needed. **Every tool in _ALL_TOOLS
+       must be registered in guardrails.RISK_LEVELS** — an unregistered tool silently defaults to
+       "needs approval" even if it's a pure no-op signal tool (this actually happened with
+       request_monthly_budget_amount, caught live — see its own Key Invariants bullet below).
   → agent.judge_output       (rule-based: drops low-content or unsupported-claim-without-evidence answers)
-→ {"answer", "contexts", "trace", "agents_used", "approvals_needed": [{"approval_id", "tool", "args",
-    "reason"}], "data_gap_needs_confirmation"?, "strategy_change_needs_confirmation"?,
-    "budget_change_needs_confirmation"?}
+→ {"answer", "narrative", "contexts", "trace", "agents_used", "approvals_needed": [{"approval_id",
+    "tool", "args", "reason"}], "data_gap_needs_confirmation"?, "strategy_change_needs_confirmation"?,
+    "budget_change_needs_confirmation"?, "awaiting_input"?}
     (base contract + extras — this response shape isn't pinned to one SPEC.md section number since it's
-    grown incrementally; SPEC.md §4-2/§5 describe the budget/strategy confirmation fields specifically).
-    `answer` always includes a human-readable summary of any pending approvals too (not just the
-    structured `approvals_needed` field) — see the "answer synthesis" invariant below.
+    grown incrementally; SPEC.md §2-3/§4-2/§5 describe the awaiting-input/budget/strategy confirmation
+    fields specifically). `answer` always includes a human-readable summary of any pending approvals
+    too (not just the structured `approvals_needed` field) — see the "answer synthesis" invariant
+    below. `narrative` (2026-09-20) is the same content minus the approval/strategy/budget structured
+    summary block (token/API-path text) — added so a UI with its own confirm/cancel cards doesn't have
+    to show that block twice; `answer` is kept byte-for-byte backward compatible for Swagger-only use.
 
 POST /approve {approval_id}  →  agent.execute_approved_action(approval_id) — looks up the id in
     approvals.py, atomically pending→executing, runs the *stored* tool/args (never trusts anything the
@@ -653,6 +677,171 @@ Key invariants to preserve when touching this code:
   decision-verb endings are effectively unbounded — don't treat this fix (or the next one) as having
   closed the category, just as having covered what's been reported so far. Full transcript: REPORT.md
   §19-2.
+- **Follow-up input state (`awaiting_input`, SPEC §2-3) — a stateless API needs a structural way to
+  know "this message answers the question I just asked," found via the chat UI (2026-09-20).**
+  "자 뭐부터 시작하면 돼?" → plan_agent asks what monthly amount to use → the user replies just
+  "200만원" → that bare reply carries none of `_RECURRING_CADENCE_WORDS`/`_BUDGET_DECISION_WORDS`/
+  "예산", so `route_question` returns `[]` and it gets rejected as out-of-scope — the API is
+  stateless, so nothing connects it to the question that was just asked. Scanning `answer` text for
+  "얼마" was explicitly rejected as a fix (too fragile). Fixed the same way `select_strategy`/
+  `set_monthly_budget` confirmation works — a server-issued token the client echoes back — but kept
+  in its own store (`agent._PENDING_AWAITING_INPUT`) since this isn't "confirm a proposal," it's
+  "resume a question": `request_monthly_budget_amount` (new no-op tool, no args, no side effect other
+  than minting the token) is what plan_agent must call before asking for an amount in its own words;
+  `run()` checks an incoming `awaiting_input_token` *before* routing, and if the message contains a
+  parseable KRW amount (`_parse_krw_amount`, handles "200만원"/"200만 원"/"2,000,000원") it calls
+  `_propose_budget()` directly — **no LangGraph worker, no LLM call at all** for that turn — guarantees
+  the parsed amount is exactly what gets proposed, not whatever the model decides to do with it. No
+  amount found (topic changed) still consumes the token (single-use regardless of outcome) and falls
+  through to normal routing — this is what "clears the state on topic change" actually means, not a
+  separate cancel affordance. No token at all (a fresh session pasting "200만원" cold) never triggers
+  this path — a bare amount alone is still not treated as budget-setting intent, exactly preserving
+  §13-1's guard against that false positive. **Found and fixed live, mid-verification**: the new tool
+  wasn't added to `guardrails.RISK_LEVELS`, so the "unregistered tool defaults to needing approval"
+  rule (see the tools-partition bullet above) caught it — a no-op signal tool got stuck waiting on a
+  approval it never needed. Registered as `"read"`; added
+  `tests/test_guardrails.py::test_every_tool_agent_py_registers_has_a_risk_level` so a future new tool
+  missing this registration fails a test instead of surfacing live. Verified via
+  `tests/test_awaiting_input.py` (17 tests, using a `_NoInvokeLLM` fake whose `.invoke()` raises — the
+  strongest possible proof the direct path never touches the LLM) and live against Haiku 4.5 (`global.`
+  profile, isolated `BTC_AGENT_DATA_DIR`): the full "자 뭐부터 시작하면 돼?" → "200만원" exchange
+  produced a correct `budget_change_needs_confirmation` with `amount_krw=2000000.0`, and
+  `month_state.json` stayed unwritten (proposal only). Full transcript: REPORT.md §20-1.
+- **Budget proposals now carry `requested_month`/`month_mismatch` — the applied-month policy (always
+  next calendar month) doesn't change, but silently substituting the user's named month without saying
+  so is its own bug** (found via the chat UI, 2026-09-20). "9월 예산은 200만원으로 할게" produced a
+  October proposal with no explanation of why September wasn't used — technically correct per §4, but
+  the substitution was invisible. `set_monthly_budget` gained optional `requested_year`/
+  `requested_month` params (same pattern as `select_strategy`'s year/month — the LLM fills them from
+  the already-injected today's-date context); `month_state.propose_budget_change` gained an optional
+  `requested_month` param and now returns `month_mismatch` (`requested_month != effective_month`).
+  **The reason has to live in the structured block, not plan_agent's prose** — because a budget
+  proposal already excludes plan_agent's free text entirely (§15-7's `_build_final_answer` rule), any
+  explanation plan_agent writes about *why* the month changed would vanish along with the rest of its
+  text. So `_build_final_answer`'s budget summary itself grew a mismatch sentence: "요청하신
+  {requested_month}에는 적용할 수 없습니다 — 월 예산 변경은 정책상 다음 달부터만 적용됩니다. 대신
+  {effective_month}부터 적용하는 제안입니다." — generated from the structured proposal dict, so it
+  can't be dropped by an uncooperative model. Omitting `requested_year`/`requested_month` (existing
+  Swagger callers, or a request that never named a month) behaves exactly as before —
+  `month_mismatch` is simply `False`. Verified via `tests/test_awaiting_input.py` (mismatch/no-
+  mismatch cases for `propose_budget_change` and `_build_final_answer` directly) and live: the LLM
+  correctly called `set_monthly_budget(amount_krw=2000000, requested_year=2026, requested_month=9)`
+  for "9월 예산은 200만원으로 할게," and the response `answer` contained the exact mismatch sentence
+  above. Full transcript: REPORT.md §20-3.
+- **A bare "얼마" is not always a price question — "예산" context without any price-indicating word
+  should not pull in `price_agent`, but a combined question still needs both agents** (found via the
+  chat UI, 2026-09-20). "10월 예산은 얼마야?" matched both `plan_agent` ("예산") and `price_agent`
+  ("얼마," previously an unconditional keyword), so `price_agent`'s "that's not my department, ask
+  finance" reply showed up next to `plan_agent`'s correct budget answer — right next to each other, it
+  read as a contradiction even though both replies were individually correct. Removed "얼마" from
+  `price_agent`'s static keyword list; `route_question` now adds `price_agent` for a "얼마" match only
+  when the question has no `_BUDGET_CONTEXT_WORDS` ("예산") *or* it also has a
+  `_PRICE_CONTEXT_WORDS` match (가격/시세/현재가/btc/price) — so "10월 예산과 BTC 현재가 알려줘"
+  still correctly reaches both agents, and a pure price question like "BTC 1만원이면 얼마나 살 수
+  있어?" (no "예산" at all) is completely unaffected. This is a routing fix, not an
+  answer-quality/prompt fix — deliberately not "call price_agent then delete its refusal text," per
+  explicit instruction to avoid that pattern. Verified via `tests/test_routing.py` (+3: pure-budget
+  question excludes price_agent, pure-price question still includes it, combined question includes
+  both) and live: `agents_used == ["plan_agent"]` only for the pure budget question, both agents for
+  the combined one, with no budget/strategy tool calls or state changes triggered by either (still a
+  read-only query). Full transcript: REPORT.md §20-2.
+- **`narrative` response field — separating "what to show" from "what to act on" structurally, not
+  via string surgery** (found via the chat UI, 2026-09-20). The chat UI shows `answer` as the visible
+  reply, but `answer` intentionally contains the full confirm/cancel instructions including the raw
+  `confirmation_token` and `POST /confirm_...` path text (that's the whole point of the structured
+  summary block, §15-7) — a UI that renders its own confirm/cancel buttons from the structured fields
+  ends up showing that same token/path text twice: once as prose, once as a button. Regexing pieces
+  back out of `answer` was explicitly ruled out (fragile, and this codebase's established stance on
+  string-surgery fixes generally). Instead extracted the pre-summary part of `_build_final_answer`
+  into its own function, `_build_narrative_text()` (same plan_agent-exclusion-when-budget-proposal
+  rule, so the two never disagree on *what* prose survives) — `_build_final_answer` now calls it
+  internally, so its own return value and every existing test against it are byte-for-byte unchanged.
+  `run()` additionally returns `narrative` = `_build_narrative_text()`'s output. `answer` keeps 100%
+  backward compatibility (still the only field a Swagger-only caller needs); a UI can show `narrative`
+  for the readable part and drive its cards off the structured fields, with `answer` tucked into a
+  collapsed debug area for anyone who wants the raw token/path text. Verified via
+  `tests/test_answer_synthesis.py`/`test_awaiting_input.py` (narrative content matches
+  `_build_final_answer`'s narrative portion exactly) and `ui/tests/test_ui_flow.py` (token string
+  absent from the rendered chat bubble but present in the debug expander; other agents' explanations
+  still show when a budget proposal is also present). Full transcript: REPORT.md §20-4.
+- **Policy change (2026-09-20, user-confirmed): mid-month signup can now start *this* month, not just
+  next month — `_budget_plan_snapshot()` picks one of three actions, not two.** Previously any signup
+  after the 1st was unconditionally pushed to next month; the user explicitly changed this policy so a
+  mid-month user can start immediately. `month_state._budget_plan_snapshot(now, state,
+  requested_month=None)` now returns `{"action": "initial"|"advance"|"change", "effective_month", ...}`:
+  - **`"initial"`** (`plan_start_month is None`): allowed target months are `{this_month, next_month}`.
+    No `requested_month` ⇒ defaults to **this month** (the actual policy flip — it used to default to
+    next month unless today was the 1st). A `requested_month` outside that pair (backdating, or more
+    than one month out) doesn't get honored as-is — it falls back to this month and
+    `month_mismatch=True`, same "explain, don't silently substitute" pattern as the existing
+    next-month-only mismatch case, just with a different allowed set and different wording (`_build_
+    final_answer` branches on `action` for this — "최초 시작은 이번 달 또는 다음 달만 가능합니다" vs.
+    the change-case "정책상 다음 달부터만 적용됩니다").
+  - **`"advance"`** (`plan_start_month` is set but still in the future, i.e. the plan hasn't started
+    yet, *and* the caller explicitly asked for `requested_month == this_month`): moving a not-yet-active
+    plan's start date earlier. New `month_state.advance_plan_start(amount_krw, new_start_month, now)`
+    sets `plan_start_month` to this month and adds a `budget_history` entry for it — it does **not**
+    touch the existing future entry (e.g. a previously-confirmed October budget stays exactly as it
+    was) — advancing is additive, never destructive, per explicit instruction ("삭제하거나 이번 달로
+    복사하지 말 것"). Only triggers on an *explicit* "this month" request while a future start is
+    pending — re-proposing without naming a month while a plan is pending-future-start is treated as an
+    ordinary `"change"` targeting whatever month is already scheduled, not an advance-by-default.
+  - **`"change"`** (everything else — plan already active, or pending-future but no explicit
+    this-month ask): unchanged from before — always next calendar month, mismatch-checked against
+    exactly that one target.
+  `propose_budget_change`/`confirm_budget_change` carry `action` (not just the old `is_initial` bool,
+  kept for backward compat) through the whole propose→confirm lifecycle, including the staleness
+  re-check (`calc_now["action"] != pending["action"]`, not just effective_month) — an `advance` proposal
+  goes stale exactly like any other if the plan state changes underneath it before confirm.
+  `init_plan()` gained an optional `start_month` param (the propose→confirm path always passes the
+  validated month explicitly now; direct callers that omit it keep the pre-existing 1st-of-month-else-
+  next-month fallback, which is why `tests/test_plan_state.py`'s direct-`init_plan()` tests didn't need
+  to change — only the propose/confirm path's *default* changed, not the low-level function's own
+  fallback). Deliberately broke and rewrote three pre-existing tests in
+  `tests/test_budget_confirmation.py` that had encoded the *old* default (asserted `"2026-10"` for a
+  bare mid-month proposal) — that was exactly the behavior being replaced, not a regression to guard
+  against. New coverage in `tests/test_mid_month_start.py` (21 tests): this-month default, explicit
+  next-month choice, backdating/over-shoot mismatch fallback, advance propose/confirm/cancel, advance
+  preserving the existing future entry byte-for-byte, advance staleness, active-plan changes still
+  always targeting next month (regression guard), existing-buy vs. no-buy `get_month_status` reflection
+  mid-month, decline_day refusing to judge without a first-buy record, strategy-selection cutoffs for a
+  mid-month-started plan, last-day-of-month signup, and backtest producing byte-identical output before
+  and after an advance (`run_backtest` never reads `month_state` at all — confirmed by grep, not just
+  assumption). Live-verified against Haiku 4.5 (`global.` profile, isolated `BTC_AGENT_DATA_DIR`): "9월
+  부터 시작할게, 예산은 200만원으로 할래" (September being the actual current month in the test)
+  produced `action="initial"`, `effective_month="2026-09"`; a full advance flow (explicit next-month
+  signup → confirm → "이번 달부터 바로 시작하고 싶어. 이번 달은 150만원으로 할게") correctly called
+  `get_month_status` first, then `set_monthly_budget(amount_krw=1500000, requested_year=2026,
+  requested_month=9)`, produced `action="advance"` with `previous_start_month="2026-10"`,
+  `previous_start_amount=2000000.0`, and after confirm `month_state.json` held **both** budget entries
+  (1.5M for September, 2M for October) with `plan_start_month` moved to September; a bare "예산
+  200만원으로 시작할래" with no month named at all defaulted to `effective_month="2026-09"` (the this-
+  month default, live-confirmed, not just unit-tested). Full transcript: REPORT.md §21.
+- **`plan_agent`'s prompt now covers mid-month first-buy handling, mid-month strategy selection, and
+  backtest/actual-plan separation — all prompt-level, no new tools, because the underlying data
+  (`ledger.month_budget_status()`, `can_select_strategy()`) already had everything needed.** Enabling
+  mid-month starts surfaced a class of narrative risk that isn't a routing or state bug: an LLM asked
+  "start this month" could plausibly assume "confirmed today ⇒ day-1 half-purchase already happened,"
+  or answer a decline_day condition question by inventing a backdated virtual buy, or explain a
+  backtest run as if it reproduced the user's actual partial month. None of these are code defects to
+  fix (the domain functions were already correct — `ledger.month_budget_status()` aggregates by real
+  `executed_date` regardless of which day the plan started; `evaluate_current_condition()` already
+  refuses to judge decline_day without a real `first_buy_price`; `backtest.run_backtest()` has zero
+  coupling to `month_state`, verified by grep), they're purely about what the model *says* given
+  correct data. Added explicit instructions: always call `get_month_status` before saying anything
+  about this month's buy status; if `buy_count > 0` already, report the real `remaining_krw` and don't
+  repeat a "buy the first half" prompt; if a user claims a past buy that isn't in the ledger, ask for
+  amount/quantity/price/date and route it through `record_virtual_buy`'s normal approval flow — never
+  fabricate a record; if `buy_count == 0`, frame the budget's half as the first step regardless of which
+  calendar day it is, but state plainly that recording only happens after the user reports the real
+  execution; never assert a decline_day condition is met/unmet without a real first-buy price, and never
+  synthesize a virtual backdated buy to make that judgment possible; strategy stays not auto-carried
+  into next month (existing rule, restated in this context since mid-month starts made the question
+  "does this month's pick apply going forward" newly relevant); and backtest output is never described
+  as reproducing the user's actual partial-month history. No dedicated tests exist for prompt wording
+  itself (as with every other prompt-only guidance in this file) — the structural guarantees it leans on
+  (ledger aggregation, decline_day's None-first-buy refusal, backtest's independence) are what
+  `tests/test_mid_month_start.py` actually covers.
 - **`plan_agent`/`research_agent` system prompts each know what they're *not* authoritative on** —
   `research_agent` is told not to assert the user's actual current state (budget/strategy/plan-started)
   from docs alone; `plan_agent` is told not to explain a strategy's exact trigger *condition* from
@@ -693,6 +882,359 @@ Key invariants to preserve when touching this code:
   Don't resurrect it as a reference for how indicators/ledger should work; `indicators.py`/`ledger.py`
   are the current implementations and were built specifically to fix bugs in the old versions (RMA vs
   SMA RSI, 200-day cap mislabeled "52-week," no `record_id` to target amend/cancel at).
+- **Strategy *selection* and "is the current condition met" are different questions — don't let a
+  keyword-name match alone decide routing, and never gate selection on the condition value** (found via
+  a real UI report, 2026-09-20: "RSI매수 로 할게" only ever reached `price_agent`/`research_agent` and
+  got an explanation of what RSI is, never a `select_strategy` proposal — RSI ≤ 30 not being currently
+  true was irrelevant; the user is allowed to *select* RSI strategy regardless of whether its condition
+  has fired yet, same as they could pick 하락일/정기분할 at any RSI value). Rather than add one keyword
+  for the exact reported sentence (explicitly rejected per the user's own instruction), `route_question`
+  now matches on **strategy-name word × decision-word combination** — `_STRATEGY_NAME_WORDS` (rsi/
+  하락일/정기분할/decline_day/biweekly) combined with `_STRATEGY_DECISION_WORDS` (a deliberately
+  affirmative-only endings list: "로 할게"/"로 바꿔줘"/"로 정할래"/etc.) pulls in `plan_agent`. The
+  affirmative-only word list is what makes negation ("RSI로 바꾸지 마") safe *by construction*, not by a
+  separate negation check — "바꾸지 마" simply isn't one of the decision endings, so it can never match
+  this rule. `plan_agent`'s own `select_strategy`/`can_select_strategy` gating (15일 이후 정기분할
+  restriction, etc.) is untouched — this only fixes whether the request *reaches* `plan_agent` at all.
+  Verified via `tests/test_routing.py` (8 new cases: 3 decision phrasings incl. the exact reported one,
+  bare-name-without-decision-word non-match, negation non-match, plus the ledger/research cases below)
+  and live against Haiku 4.5 (`global.` profile, isolated `BTC_AGENT_DATA_DIR`): "RSI매수 로 할게" →
+  `strategy_change_needs_confirmation` token minted → `/confirm_strategy_change` → a follow-up status
+  query correctly reports RSI as the selected strategy; "RSI로 바꾸지 마" → no `plan_agent` match, no
+  proposal at all.
+- **A past-tense buy *report* ("오늘 50만원어치 BTC 매수했어") is a statement of fact, not an
+  imperative — routing that only recognizes command forms ("매수해줘") misses it entirely** (same UI
+  report, 2026-09-20). Fixed by adding `"매수했어"`/`"샀어"`/`"구매했어"` to `ledger_agent`'s keywords
+  and telling its prompt to treat these as reports to be recorded via `record_virtual_buy`, while
+  explicitly excluding three phrasings that share surface words but aren't reports: a calculation
+  question ("50만원 사면 얼마나 돼?" — price_agent's job), a decision-help question ("50만원 살까?" —
+  not yet decided), and negation ("아직 안 샀어"/"안 살래" — no purchase happened). **When the report
+  is missing `price_krw`/`quantity_btc` entirely, the fix does not rely on the model reliably calling
+  `request_buy_execution_detail` first** — live verification with the actual submission model (Haiku
+  4.5) reproduced exactly this failure: the prompt says to call the tool, but the model sometimes just
+  answers in prose asking for price/quantity without calling anything, so no `awaiting_input` token gets
+  minted and the next turn's "1억원에 샀어" has nothing to attach to. `_maybe_force_buy_execution_request`
+  in `run()` is a structural safety net that doesn't depend on the model following that instruction: if
+  `ledger_agent` matched, the turn produced neither an approval nor an `awaiting_input`, the message has
+  exactly one KRW amount, no quantity mention, and no negation word, the server calls `request_
+  buy_execution_detail` itself and overwrites `answers_by_agent["ledger_agent"]` with a clean, correct
+  question — a message with two amounts or an already-present quantity is left alone (ambiguous enough
+  that guessing which number is what would be worse than not intervening). Also fixed the KRW parser
+  itself: `_parse_krw_amount` only ever handled "만" notation, silently returning `None` for "억"
+  (100,000,000) — the natural unit for a BTC price — replaced with `_KRW_AMOUNT_VALUE_RE` (named groups
+  for eok/man_after_eok/man/plain) so "1억원"/"1억 500만원"/"200만원" all parse correctly; `_BTC_
+  QUANTITY_RE` added for the "0.005 BTC"/"0.005개"/"0.005비트코인" quantity notation, which never
+  overlaps with the price notation by construction (one always ends in "원", the other never does).
+  Full flow — report → `request_buy_execution_detail` (forced when the model doesn't call it itself) →
+  follow-up price/quantity → `record_virtual_buy` approval card → ledger unchanged pre-approval →
+  approve → correct `amount_krw`/`price_krw`/`executed_date` in the ledger, no fabricated time — is
+  covered by `tests/test_buy_report_awaiting_input.py` (19 tests, including the forced-fallback cases
+  and the deliberately-adversarial two-amounts/has-quantity/negation non-trigger cases) and re-verified
+  live end to end against Haiku 4.5 in an isolated `BTC_AGENT_DATA_DIR`, including the calculation/
+  decision-help/negation phrasings correctly producing no record and a double-approval call correctly
+  returning 409 without duplicating the ledger entry.
+- **A bare "전략" keyword match on `research_agent` for a personal-status question produces an unneeded
+  refusal/redirect sentence sitting next to `plan_agent`'s correct answer** (same UI report, 2026-09-20):
+  "9월의 예산과 전략을 알려줘" got a correct `plan_agent` answer plus an unnecessary `research_agent`
+  note saying it doesn't handle personal state and to ask `plan_agent` — which the user had, in the same
+  message, already gotten answered. Rather than special-case this one sentence, `route_question` now
+  strips `research_agent` from the match only when **all** of: the question has personal-context signal
+  (a `\d{1,2}월` month number, or "내"/"제"/"이번 달"/"다음 달"), it has no concept-query signal ("무슨
+  뜻"/"정의가"/"원리가"/"조건이 뭐"/etc.), and "전략" was the *only* `research_agent` keyword that
+  matched (re-checked against every other keyword in the list) — that last condition is what keeps a
+  compound question like "내 전략은 뭐고 RSI는 무슨 뜻이야?" routing to both agents, since "RSI" is a
+  second, independent `research_agent` keyword match. Verified via `tests/test_routing.py` (personal-
+  status-alone, compound-question-both-agents, general-concept-question-still-reaches-research_agent)
+  and live: the exact reported sentence now returns `agents_used == ["plan_agent"]` only, clean answer.
+- **`get_month_status`'s tool output must state "first half is unconditional, second half is condition-
+  gated" as two distinct sentences computed from real state — trusting the model to reconstruct that
+  distinction from a single ambiguous "매수 신호를 기다리는 상태" produces a wrong answer** (same UI
+  report, 2026-09-20, item #4): for `{월 예산 100만원, 사용액 0원, 매수 기록 없음, 선택 전략 RSI}` the
+  actual answer was "남은 100만원의 예산으로 매수 신호를 기다리는 상태" — which wrongly implies the
+  *entire* remaining budget, including the unconditional first-half amount, is waiting on the RSI
+  signal. Fixed structurally (not by prompting the model to phrase it more carefully): the
+  `get_month_status` tool wrapper in `agent.py` (not `month_state.py`'s domain function) now appends one
+  of three deterministic sentences computed directly from `status["buy_count"]`/`month_state.
+  month_end_cutoff_passed()`: (a) no buy yet + not month-end → state "사용액은 0원"(without asserting
+  "no purchase happened" from record-absence alone) and name the first-half step amount explicitly; (b)
+  buy_count > 0 → report the existing count instead of first-step guidance; (c) month-end already passed
+  → state the full-remainder rule instead of a half-amount step (no duplicate first-half+full-remainder
+  announcement). Verified via `tests/test_mid_month_start.py` (5 new cases, including a `datetime`-
+  patched last-day-of-month case and a case confirming an actual non-half buy amount is preserved in the
+  remaining-budget calc rather than assuming exactly half) and live: the exact reported scenario's
+  `plan_agent` answer now states "현재 기록 기준 사용액은 0원"/names the first-buy-step amount
+  explicitly, and — confirmed in the same live session after an approved buy — correctly switches to
+  reporting the existing buy count instead of repeating first-step guidance.
+- **DD/MDD policy change (2026-09-20, user-confirmed): drawdown is now close-based, not high-based, and
+  MDD (maximum drawdown, not just "current drawdown") is a new, separate value.** The old `high`-based
+  DD (`compute_drawdown()`) is gone entirely — `indicators.compute_dd_mdd()` never reads a candle's
+  `high` field at all, verified by a dedicated test that changes `high` while holding `close` fixed and
+  asserts the result is byte-identical. Both DD and MDD are computed in a **single pass** over the
+  period's candles: track a running peak-close (the max close seen so far, starting fresh at the
+  window's own start date — a peak from before the window never leaks in), compute
+  `(close_t / peak_so_far - 1) * 100` at every day, and MDD is simply the minimum of that series while DD
+  is that same value at the *last* day (which is mathematically the same as `(end_close / window_max_close
+  - 1) * 100`, since by the last day the running peak *is* the window's global max) — this single-pass
+  design is what makes `MDD ≤ DD ≤ 0` hold unconditionally, not something checked after the fact.
+  Verified against every worked example in the request, including the two that pin down the "peak-before-
+  trough" requirement: closes 100→60→90 gives DD=-10%/MDD=-40% (the deep dip is the whole story), while
+  60→100→90 gives DD=-10%/MDD=-10% (the *early* low of 60 happens before any peak was set, so it
+  contributes nothing to MDD — a naive "just take the window's min/max" implementation would wrongly
+  compute -40% here too). `tests/test_dd_mdd.py` (23 tests) also covers: multiple peak/trough cycles
+  picking the single deepest post-peak drop; a genuine month-end-date-correction case for the 48-month
+  window that only shows up at a century boundary (2104-02-29's 48-months-back date is 2100-02-29, but
+  2100 isn't a leap year since it's divisible by 100 but not 400 — corrected to 2100-02-28, verified by
+  directly computing `_shift_months` first before writing the fixture, not by assumption); a 365-day
+  window correctly spanning a leap year; a peak sitting just outside the requested window being excluded;
+  zero/negative close values inside a window forcing `None` (never silently skipped); and one period's
+  data shortfall not blocking a different period's calculation (see the next bullet, same principle at
+  the `agent.py` level).
+- **RSI/MA200's all-or-nothing gap check and each DD/MDD period's own window check are now independent —
+  one indicator's missing data no longer blocks a different indicator that doesn't need that data**
+  (2026-09-20, explicit requirement: "한 기간의 데이터 부족을 다른 기간이나 RSI 부족으로 일괄 처리하지
+  말고"). Before this change, `_indicators_summary()` had one blanket `if len(records) < 200: return
+  "..."` gate in front of *everything*, including the 30-day DD/MDD window, which only actually needs 30
+  days of confirmed history — a account with, say, 100 days of history (not unusual right after
+  `price_history` backfill or in a from-scratch test environment) would get a hard "insufficient data"
+  wall even though its 30-day DD/MDD was perfectly computable. Restructured into two independent checks
+  in the same function: RSI/MA200 still requires `len(records) >= 200` *and* a full-range gap check
+  (`_required_range_gap_message`, unchanged — RSI's cumulative RMA genuinely needs the *entire* available
+  history to be contiguous, not just the last 200 days, since `compute_rsi_series()` recomputes the whole
+  series from `records[0]` every call); each of the three DD/MDD periods independently calls
+  `compute_dd_mdd()`, which only checks *its own* window's date completeness (via `_window_for_period()`)
+  — a gap or shortfall far outside a given period's window can no longer block that period. Two distinct
+  "can't compute" messages are deliberately worded differently so they're never conflated: the RSI/MA200
+  block message reuses the existing `_required_range_gap_message()` wording (contains "결측") when the
+  cause is an actual internal gap, while a DD/MDD period's own "계산 불가" message deliberately never
+  says "결측" (it can't tell the difference between "the window has a gap" and "there simply isn't that
+  much history yet" — both collapse to the same `None` from `compute_dd_mdd()` — so it states only the
+  period name and lets that ambiguity stand honestly rather than overclaiming a specific cause).
+  `record_watch_decision`'s indicator snapshot got the identical treatment (RSI/MA200 populated only
+  under the full gate, DD/MDD populated independently per period) — proven with a fixture that removes
+  one day from the middle of a 250-day series: `rsi14` is correctly absent from the snapshot, but the
+  last-30-days DD/MDD (which doesn't touch that removed day) is still present. Verified via
+  `tests/test_dd_mdd.py` and updated `tests/test_required_range_gap_detection.py` (both files' assertions
+  were rewritten to check for this independence rather than the old all-or-nothing behavior — this was a
+  deliberate behavior change, not a regression fix).
+- **DD/MDD snapshots carry a calc-basis version tag (`dd_mdd_calc_basis`, currently `"close_v1"`,
+  exposed as `indicators.DD_MDD_CALC_BASIS`) so a future policy change can't silently blend with this
+  one** (2026-09-20, explicit requirement not to reinterpret old watch-decision snapshots under the new
+  basis). No real historical `record_watch_decision` snapshot ever stored a DD value at all before this
+  change (the old snapshot only ever held `rsi14`/`ma200_deviation_pct`/`as_of`) — so there's no
+  migration to do and no ambiguous old data to reconcile; the version tag exists purely so *this* policy
+  change's own snapshots are self-describing going forward, the way `price_history.py`'s `CACHE_VERSION`
+  already does for the price cache file. Don't bump this string for anything other than an actual change
+  to how DD/MDD itself is calculated.
+- **Live verification turned up a real DD/MDD coincidence, not a bug: the 48-month and 365-day windows
+  can legitimately produce numerically identical DD/MDD** (2026-09-20, live check against Haiku 4.5, real
+  price cache). The real BTC price history's actual 4-year peak (2025-10-08) and the post-peak trough
+  (2026-08-14) both happen to fall inside the most recent 365 days, so both windows' running-peak
+  algorithm converges on the exact same peak/trough pair even though the windows themselves span very
+  different start dates (`start_date` differs, `mdd_peak_date`/`mdd_trough_date` are identical) —
+  confirmed by computing both windows directly against the raw cache file before concluding this wasn't
+  an off-by-one in `_window_for_period`/`_shift_months`. Don't "fix" this by assuming the two periods
+  should generally differ; whether they match is a fact about the actual price history, not a code
+  invariant.
+- **Incidental finding, not touched this round: `src/tools.py`'s legacy `PRICE_CACHE_PATH` does not
+  respect `BTC_AGENT_DATA_DIR`** (found during this round's live verification, 2026-09-20) — it's a
+  module-level `Path(__file__).resolve().parents[1] / "data" / "price_cache.json"`, hardcoded independent
+  of the env var that `ledger.py`/`month_state.py`/`price_history.py` all honor. A live query that calls
+  the still-in-use legacy `get_btc_price` tool (SPEC's other domain modules were rewritten specifically to
+  fix bugs in `tools.py`, but this one function was kept — see the `tools.py` bullet elsewhere in this
+  file) writes the *real* `data/price_cache.json` even when `BTC_AGENT_DATA_DIR` points elsewhere, as
+  happened during this round's isolated verification run. Low actual risk — the file is gitignored,
+  holds only a short-lived public price+timestamp with no user data, and gets overwritten by any query
+  regardless of isolation — but it's a real gap in the isolation guarantee this file documents elsewhere,
+  left unfixed since it's unrelated to this round's actual task and wasn't asked for.
+- **A spending/remaining-amount query without the literal word "예산" ("이번 달 얼마 썼어?") has the
+  exact same `price_agent`-via-"얼마" false-positive as the budget-word case in §20-2, and needed the
+  same fix generalized, not a new one-off word** (2026-09-20, live-reproduced: after a real buy approval,
+  `plan_agent` answered spend/remaining/budget correctly, but `price_agent` also fired and added a
+  "personal spending isn't my department" refusal next to it). `_BUDGET_CONTEXT_WORDS` alone couldn't
+  catch this because "썼어"/"샀어"/"남았어"/"지출"/"쓴 금액" never contain "예산" — added
+  `_SPENDING_QUERY_WORDS` and OR'd it into the same has-budget-context check that already existed for
+  §20-2, so the fix is additive to the existing mechanism rather than a parallel one. A second, separate
+  gap: "얼마 남았어?" on its own contains neither "이번 달" nor "예산" nor any other existing keyword, so
+  it matched *nothing* before this fix (would have been rejected as out-of-scope) — a new rule
+  (`_AMOUNT_QUESTION_RE` + any `_SPENDING_QUERY_WORDS` word → `plan_agent`) closes that gap the same way
+  the budget-decision and buy-timing "open-ended phrasing" rules elsewhere in this file do. Combined
+  price+spending questions are deliberately unaffected (the existing `has_price_context` override still
+  wins), verified live: "이번 달 얼마 썼어? 그리고 BTC 지금 가격도 알려줘" still reaches both agents.
+- **A genuinely compound question (both parts legitimately in scope, both agents correctly matched) can
+  still produce boilerplate "that's not my department, ask the other agent" text from *each* agent about
+  the *other* agent's already-answered part — this is a different defect from routing overlap and needs
+  its own prompt guard on both sides** (2026-09-20, found live while verifying the fix above, not by a
+  separate report). Unlike the accepted "keyword-sharing agent politely declines" tradeoff documented
+  above (which is about an agent that was never the right target for the *whole* question), this is two
+  agents that *were both* correctly matched for a real compound question, each redundantly commenting on
+  the half the other one already covers — first observed as `price_agent` writing "지출 내역은 다른
+  부서에 문의하시기 바랍니다" right next to `plan_agent`'s own correct spend/remaining answer in the
+  very same response, and symmetrically `plan_agent` adding "BTC 가격은 제 담당 범위가 아닙니다, 
+  price_agent에게 물어봐 주세요" right below `price_agent`'s own correct price answer. Fixed with a
+  short paragraph in *both* prompts telling each agent: when the question also asks about the other
+  agent's territory, answer only your own part and don't add a decline/redirect sentence about the
+  other part — it's already answered in the same response, not left unanswered. Re-verified live after
+  the fix: the outright refusal phrasing is gone; each agent now at most adds one short, non-declining
+  cross-reference sentence ("이번 달 지출 내역은 plan_agent가 별도로 답변해드립니다"), which is the
+  same accepted brief-mention style already used elsewhere in this file (e.g. `price_agent`'s existing
+  "그 전략의 조건 충족 여부는 plan_agent가 별도로 확인해줄 수 있다는 점만 짧게 덧붙이고") — not a new
+  problem, and not something this round tried to eliminate entirely.
+- **`ledger_agent`'s past-tense-report keyword set ("샀어" etc.) also matches retrospective *summary*
+  questions ("이번 달 얼마나 샀어?"), which are queries, not new purchase reports — the existing three
+  report-exclusion categories (calculation/decision-help/negation) didn't cover this fourth one** (found
+  during the same live check, 2026-09-20). Structurally this was already safe —
+  `_maybe_force_buy_execution_request`'s forced-`awaiting_input` safety net requires exactly one KRW
+  amount in the message, and a pure summary question like this has none, so it can never accidentally
+  mint a token or approval — but the prompt still needed to say explicitly not to treat this as a report
+  needing price/quantity follow-up, and to answer it via `search_ledger` (with year/month filled in,
+  per the existing month-scoping rule) instead. Verified live: `agents_used` included both `plan_agent`
+  and `ledger_agent` for "이번 달 얼마나 샀어?", `ledger_agent`'s answer correctly summed the ledger
+  records for the month with no approval/awaiting-input generated, and file-hash comparison before/after
+  confirmed the query made zero writes to `ledger.json`/`month_state.json`.
+- **Final verification of `evaluation/test_queries.csv` against the real submission model turned up
+  three real, distinct issues — one code gap, one stale CSV expectation, one stale judge keyword list;
+  don't conflate them** (2026-09-20, running `evaluation/run_eval.py` for real, not just reading the
+  CSV). Round 1 of the run: 21/24. Fixed each properly rather than patching the symptom:
+  - **Code gap**: `_BUY_REPORT_KEYWORDS`/`_AGENT_KEYWORDS["ledger_agent"]` only covered "매수했어"/
+    "샀어"/"구매했어" — CSV #6's "오늘 정기 매수로 100만원 넣었어 기록해줘" uses "넣었어" instead,
+    which routing only caught by luck (the generic "기록" keyword happened to also be present) and the
+    `_maybe_force_buy_execution_request` safety net didn't recognize at all, so the model's own prose-
+    without-tool-call reproduced the exact §22-2 failure again under a phrasing variant. Added "넣었어"/
+    "투자했어" (+ formal `-습니다` endings) to both lists — same "keep widening as reported" limitation
+    already documented elsewhere in this file, not a one-off patch.
+  - **Stale CSV expectation**: #14's `expected_tools=get_month_status` was written in 2026-09-17 when
+    `evaluate_current_condition` didn't exist yet; it's been wired since 2026-09-18 (see its own bullet
+    above) and is what the model now correctly calls for "10일에 조건 충족됐다는데 지금도 매수
+    가능해?" — the CSV's own expectation, not the app, was wrong. Updated it and its note.
+  - **Stale judge keyword list**: #9 "이더리움 지금 얼마야?" got a perfectly correct refusal ("저는
+    비트코인(BTC) 시세와 지표만 조회할 수 있습니다. 이더리움 가격은 제 담당 범위가 아닙니다") that
+    `run_eval.py`'s hardcoded `refusal_markers` list simply didn't contain a matching phrase for — the
+    same recurring rule-based-judge-staleness class already documented for round 3. Added "담당 범위가
+    아닙니다"/"담당이 아닙니다"/"담당하지 않"/"만 조회할 수 있습니다"/"만 답할 수 있습니다".
+  - **A fourth issue surfaced while fixing #6's CSV wording**: giving the model *both* an amount and a
+    price in one sentence without a quantity ("100만원어치를 1억원에 매수했어") made it stop and ask
+    whether "1억원" meant the per-BTC unit price or the total paid — a reasonable-sounding but incorrect
+    hesitation, since `price_krw` is always the per-BTC unit price by convention and the total is already
+    `amount_krw`. Clarified this explicitly in both `record_virtual_buy`'s docstring and `ledger_agent`'s
+    prompt (with the literal phrasing as the worked example) — but the model **still** asked the same
+    question live after that fix. Rather than keep fighting a model quirk that isn't actually unsafe (an
+    over-cautious clarifying question is a UX cost, not a wrong action), the CSV question itself was
+    rewritten to state amount, quantity, *and* price explicitly, removing the inference the model
+    seemed reluctant to make on its own — confirmed live afterward that it goes straight to
+    `record_virtual_buy` and `approvals_needed`. The prompt/docstring clarification was kept anyway since
+    it's still correct guidance for the more common case where quantity is genuinely omitted.
+  - Round 2 after all fixes: **24/24**. `tests/test_routing.py`/`tests/test_buy_report_awaiting_input.py`
+    each gained a regression test for the "넣었어"/"투자했어" gap specifically (both the routing keyword
+    and the forced-fallback keyword, tested separately since they're two different lists for two
+    different purposes). Not persisted as a new `evaluation/roundN_report.md` — the per-round report
+    file layout was being reorganized independently of this task (`round3_report.md`–`round5_report.md`
+    consolidated into `round2_report.md`, `round1_report.md`'s cross-links updated to match) while this
+    verification was in progress; that reorganization was left untouched and this bullet is the record
+    of what changed and why instead.
+- **A greeting or "what can you do?" meta-question about the service itself is not the same kind of
+  out-of-scope question as an unrelated topic — it needs its own fixed answer, not the generic rejection,
+  and it needs to bypass the LLM entirely since no single agent owns it** (found via a real screenshot of
+  the chat UI, 2026-09-20: "안녕"/"넌 무슨일을 할수있니" both got the same flat "이 어시스턴트는 BTC
+  예산·전략 계획·시세·지표·매수 기록에 대해서만 답할 수 있습니다" as a genuinely unrelated question
+  would — a new user asking what the service does learns nothing about what it can actually do). No
+  `_AGENT_KEYWORDS` entry is the right fix here (this isn't "route to the agent that handles this," it's
+  "no agent handles this, but it isn't nonsense either") — `run()` now checks
+  `_GREETING_OR_CAPABILITY_RE` only in the already-existing `if not agents:` branch (so a question that
+  *does* match a real agent, e.g. "안녕하세요, 이번 달 예산 얼마 남았어?", is never intercepted — the
+  greeting text is just a prefix there and the real question routes normally) and returns a fixed
+  `_CAPABILITY_INTRO_TEXT` with **zero LLM/graph invocation**, verified the same way the awaiting-input
+  direct-resolution path is (`_NoInvokeLLM` fake whose `.invoke()` raises). **Korean text broke the
+  naive `\b`-based regex approach**: `\b` is defined relative to `\w`, and Python's `re` treats Hangul
+  syllables as `\w`, so there is no boundary *between* adjacent syllables the way there is between an
+  English word and a space — `r"^\s*(안녕|...)\b"` matched "안녕" but not "안녕하세요" (found by an
+  actual failing test, not by inspection) since "하" right after "녕" is also a word character. Fixed by
+  dropping `\b` for the Korean prefix alternatives (anchored on `^\s*` instead, which is what actually
+  captures "starts with a greeting") and keeping `\b` only for the Latin "hi"/"hello" alternatives, where
+  it works as intended. Capability-question phrasing has the same open-ended-variants limitation as
+  buy-timing/budget-decision phrasing elsewhere in this file (`무슨 일을 할 수 있`/`뭘 할 수 있`/`어떤
+  도움`/`기능이 뭐` etc. are covered, not an exhaustive set) — accepted, not something this fix claims to
+  close completely. Verified via `tests/test_greeting.py` and live against Haiku 4.5 (`global.` profile):
+  both reported phrasings produced the exact fixed intro text with `agents_used == []`, a genuinely
+  unrelated control question ("오늘 날씨 어때?") still got the original generic rejection unchanged, and
+  a real question with a greeting prefix still routed to and was answered by `plan_agent` normally.
+- **A vague "analyze BTC for me" request is not the same thing as the buy-timing verdict question this
+  file already handles (§18/§18-2) — it needs its own keyword coverage, not an assumption that it's
+  already covered by "지표"** (same screenshot-driven report, 2026-09-20). "BTC 분석해줘"/"BTC 현재
+  상황 알려줘" matched no `price_agent` keyword at all (the semantically identical "BTC 지표 알려줘"
+  already worked, via the literal word "지표") and got the generic out-of-scope rejection. Added
+  "분석"/"현재 상황"/"상황 알려줘"/"상황이 어때" to `price_agent`'s keywords, and a short prompt
+  paragraph telling it that a request phrased as "분석" still gets the same value-plus-meaning answer
+  via `get_indicators` as every other indicator question in this file, not a composite verdict — "분석"
+  sounds more like it's asking for a judgment than "지표", so this was called out explicitly rather than
+  assumed to be covered by the existing buy-timing-verdict guidance. Verified via
+  `tests/test_routing.py::test_general_analysis_requests_reach_price_agent` and live: both phrasings
+  routed to `price_agent` alone and produced the same RSI/MA200/DD/MDD-values-plus-meaning answer as
+  "BTC 지표 알려줘," ending with the same "종합해 지금이 적기라고 판정해드리지는 않습니다"-style
+  disclaimer rather than a buy/wait recommendation.
+- **"현재 전략"/"지금 전략" is exactly as personal a question as "이번 달 전략" — §22-3's fix only
+  recognized month-phrase and possessive signals, missing this equally common way to ask the same
+  thing** (found via a real screenshot, 2026-09-20). "현재 전략이 뭔지 알려주고, 매수 조건이
+  충족되었는지 확인해줘" got a correct `plan_agent` answer (current strategy, condition-not-met status,
+  budget/spend/remaining) plus an unneeded `research_agent` refusal ("저는 서비스의 일반 개념과 규칙을
+  설명하는 역할을 하고 있어서... 개인 상태는 확인할 수 없습니다") — the exact §22-3 failure shape,
+  recurring because the question uses neither a month number/word nor "내"/"제" to signal personal
+  context, so `has_personal_context` came back `False` and the exclusion rule never fired even though
+  "전략" was still the only `research_agent` keyword matched. Added "현재 전략"/"지금 전략"/"현재
+  선택"/"지금 선택"/"선택된 전략"/"선택한 전략" to `_PERSONAL_STATUS_CONTEXT_WORDS` — deliberately
+  compound phrases, not bare "현재"/"지금" (which would be far too broad and could suppress
+  `research_agent` on legitimate concept questions that happen to contain those common words elsewhere
+  in the sentence). Same open-ended-phrasing limitation as everywhere else in this file — this closes
+  the two reported variants, not personal-status phrasing in general. Verified via
+  `tests/test_routing.py::test_current_strategy_query_without_month_word_does_not_pull_in_research_agent`
+  and live (Haiku 4.5, `global.` profile, isolated `BTC_AGENT_DATA_DIR`, state seeded to match the
+  screenshot exactly — budget 1,000,000원, decline_day selected, one 500,000원 buy approved): the exact
+  reported question now returns `agents_used == ['plan_agent']` only, with the same correct
+  strategy/condition/budget content as before, just without the extra refusal.
+- **"BTC가 뭐야"/"비트코인이 뭐야" had no keyword anywhere that would route them to `research_agent` —
+  "DCA가 뭐야?" already worked only because "dca" happens to be a literal keyword, not because generic
+  "X가 뭐야" phrasing was covered** (found via a real screenshot, 2026-09-20; `data/docs/BTC.md` exists
+  specifically for this and was never reachable for these phrasings). Adding bare "btc"/"비트코인" as
+  unconditional `research_agent` keywords was rejected — it would pull `research_agent` into completely
+  unrelated territory like "오늘 50만원어치 BTC 매수했어" (a `ledger_agent` buy report) or "비트코인
+  가격 알려줘" (a pure `price_agent` query), reintroducing exactly the class of unwanted-extra-agent
+  problem fixed repeatedly elsewhere in this file. Instead added `_BTC_CONCEPT_RE`, a combination rule
+  (topic word "btc"/"비트코인" *together with* a concept-question ending: "뭐야"/"무엇"/"란"/"이란", or
+  "설명해"/"소개해" within a short distance) — mirrors the existing "topic word × decision/concept word"
+  combo design (§22-1's strategy-selection rule, `_STRATEGY_CONCEPT_QUERY_WORDS`) rather than adding a
+  bare high-collision keyword. Also folded a match of this regex into `has_concept_query` in the existing
+  personal-status-removal check (see the "현재 전략" bullet above) so a `research_agent` match added by
+  this new rule is never accidentally stripped back out by that unrelated logic — a real edge case that
+  would otherwise only surface on a contrived combined sentence, closed defensively rather than left as
+  a latent interaction bug between two independently-added rules. Verified via `tests/test_routing.py`
+  (BTC-concept phrasings reach `research_agent`; pure price query and pure buy report do *not* pull it in
+  via this rule) and live (Haiku 4.5, `global.` profile): "BTC가 뭐야"/"비트코인이 뭐야" both produced
+  accurate, `BTC.md`-grounded explanations (supply cap, halving, decentralization, risks) via
+  `research_agent` alone.
+- **A second, independent bug surfaced live for "비트코인에 대해 설명해줘" even after the routing fix
+  above: the question routed correctly and the embedding search found the exact right chunk, but the
+  relevance gate (`retriever.assess_retrieval()`) rejected it anyway** (found live, 2026-09-20, not by
+  inspection — the model's own choice of `retrieve_docs` query string, "비트코인 개념 정의", is what
+  actually exposed this). `assess_retrieval()` extracts noun-tagged keywords from the query and from the
+  retrieved chunk text via Kiwi, and requires ≥1 overlapping keyword *and* ≥40% overlap ratio. The bug:
+  "개념"/"정의" are meta-nouns describing *what kind of answer* the user wants ("a concept," "a
+  definition"), not the topic itself — they are real nouns (so Kiwi tags them, so they entered the
+  keyword set) but have no reason to appear verbatim in prose written to explain the topic (`BTC.md`
+  never uses the word "개념" at all), so they only ever inflate the denominator without ever being
+  matchable — leaving only "비트코인" as an overlap out of 3 query keywords, a 33% ratio that misses the
+  40% cutoff despite the retrieval being exactly correct. **The fix is not to lower the 40% threshold**
+  (that would just let more genuinely-irrelevant results through, defeating the gate's purpose) — it's to
+  stop counting words that were never going to be topical matches in the first place.
+  `retriever._QUERY_META_NOUNS` (개념/정의/설명/소개/뜻/의미/질문/궁금/요약/내용) is now excluded inside
+  `_keywords()` itself (used for both the query side and the document side, so the exclusion is
+  symmetric) — a query that becomes empty after this filtering (e.g. a bare "설명해줘" with no real topic
+  noun at all) still correctly yields `usable=False`, since an empty keyword set was already handled as a
+  failure case before this change. Verified via `tests/test_retriever_relevance_gate.py` (4 tests, pure
+  Kiwi tokenization, no AWS/embedding calls — deterministic and fast): meta-nouns excluded from
+  `_keywords()`; the exact reproduced query+chunk pair now scores `usable=True`; a genuinely unrelated
+  query (real topic words that truly don't overlap) is still correctly rejected; an all-meta-noun query
+  still correctly yields `usable=False` rather than vacuously passing. Re-verified live end-to-end after
+  restarting the server: "비트코인에 대해 설명해줘" now returns the full grounded `BTC.md` explanation
+  instead of the false "이 서비스의 문서에는... 담겨 있지 않습니다" claim.
 
 ## How this was verified
 
@@ -734,10 +1276,10 @@ about the user's state," which rule-based string matching can't express), and `t
 deterministic calculation correctness) are three genuinely different things and are reported separately
 — never collapse them into one "eval passed" number, and **always track which model generated the
 answers being graded separately from which model did the grading** — round 3 (2026-09-17, all Sonnet):
-pytest 70/70; rule-based 19/22; LLM-as-Judge 17/22 (`evaluation/round3_report.md`). Round 4
+pytest 70/70; rule-based 19/22; LLM-as-Judge 17/22 (`evaluation/round2_report.md#legacy-round3`). Round 4
 (2026-09-18, Sonnet's daily quota ran out mid-round, switched to Haiku *with the user's explicit
 approval* for both answer generation and judging): pytest 102/102 (model-independent); rule-based
-22/22; LLM-as-Judge 14/22 → 19/22 (`evaluation/round4_report.md`, which also lists the 3 remaining
+22/22; LLM-as-Judge 14/22 → 19/22 (`evaluation/round2_report.md#legacy-round4`, which also lists the 3 remaining
 LLM-as-Judge failures by question ID with the actual answer text and why each is judged a scenario/CSV
 issue rather than a code defect, and classifies every judge/CSV/marker change made that round as either
 "fixed a wrong verdict" or "loosened the bar," with the reasoning for each). **Round 3 and round 4 used
@@ -768,9 +1310,88 @@ reported it back. Separately verified: cancel leaves the file untouched; re-conf
 already-confirmed token returns 409; all 5 intent-classification cases from the "Key invariants" bullet
 above were re-run end to end with real tool-call traces and file diffs, not just routing.
 
+**Full live verification of the 4-issue combined fix (2026-09-20, Haiku 4.5, `global.` profile, isolated
+`BTC_AGENT_DATA_DIR`)** — see the four "Key invariants" bullets above for the root causes; this entry is
+just the live-verification record: "RSI매수 로 할게" → `strategy_change_needs_confirmation` token →
+`/confirm_strategy_change` → a follow-up "9월의 예산과 전략을 알려줘" reports RSI as selected, from
+`plan_agent` alone (no `research_agent` redirect note); "RSI로 바꾸지 마" → no proposal, no `plan_agent`
+match; the same personal-status query's answer also happened to demonstrate the `get_month_status`
+enrichment working correctly ("첫 매수 단계로 500,000원 매수를 고려해보세요... 나머지 500,000원은
+RSI 조건에 따라"); the full buy-report flow — "오늘 50만원어치 BTC 매수했어" → model answered in prose
+without calling `request_buy_execution_detail` (the exact failure the structural fallback exists for) →
+server-forced `awaiting_input` token → "1억원에 샀어" → `record_virtual_buy` approval card
+(`amount_krw=500000, price_krw=100000000, executed_date=<today>`) → ledger confirmed **empty** before
+approval → approve → ledger shows the exact values, no fabricated time → a follow-up status query
+correctly reports 사용액 500,000원/남은 예산 500,000원 and lists the 1 buy record (confirming the
+existing-buy-record variant of the `get_month_status` fix too); separately verified live: "50만원 사면
+얼마나 돼?"/"50만원 살까?"/"아직 안 샀어" all produce no `awaiting_input` and no record; calling
+`/approve` twice on the same approval_id returns 200 then 409 with no duplicate ledger entry. The
+month-end-cutoff variant of the `get_month_status` fix was verified only via the mocked-`datetime` unit
+test, not live (would require either waiting for an actual month-end or a live run with the real clock
+past the 15th/month-end cutoff, neither attempted this round).
+
+**Full live verification of the RSI/DD/MDD indicator expansion (2026-09-20, Haiku 4.5, `global.`
+profile, isolated `BTC_AGENT_DATA_DIR` seeded with a read-only copy of the real price cache)** — see the
+DD/MDD "Key invariants" bullets above for the design; this entry is the live-verification record: "지금
+BTC 지표 요약해줘" → `agents_used=['price_agent']`, tools called `get_btc_price`/`get_indicators` →
+final answer correctly presented RSI(52.33)/MA200 deviation(+2.42%) plus a genuine three-row table for
+30-day/365-day/48-month DD and MDD, each stating "최고 종가" (not "최고가") with its exact date, plus
+the required "미래를 예측하지 않는다" caveat verbatim — all of this came from the tool's own structured
+text, not something the model had to reconstruct correctly on its own. A follow-up "최근 48개월 MDD
+알려줘" correctly routed to `price_agent` (accurate figure, correct peak/trough dates) plus
+`research_agent` (politely declined to supply a live numeric value, consistent with the pre-existing,
+documented "keyword-sharing is fine when the non-matching agent just declines" tradeoff — not a new
+defect introduced by adding "mdd" to `research_agent`'s keywords, same shape as the existing RSI/이동평균
+/드로다운 sharing). No repeated retries were needed (no rate limiting encountered). The month-end-passed
+branch of `get_indicators`'s per-period independence (a period whose window has *no* data at all vs. one
+with an internal gap) was verified only via `tests/test_dd_mdd.py`'s unit tests, not live — reproducing
+either condition live would require deliberately truncating the real price cache, which wasn't done this
+round to avoid any risk to the isolated copy being mistaken for real data.
+
+**Full live verification of the spending/remaining-query routing fix (2026-09-20, Haiku 4.5, `global.`
+profile, isolated `BTC_AGENT_DATA_DIR`)** — see the "Key invariants" bullets above for the fixes; this
+entry is the live-verification record. State was seeded to match the exact reported scenario (budget
+1,000,000원 confirmed, one 500,000원 buy approved), then a file-hash of `ledger.json`/`month_state.json`
+was taken before and after each of the four reported query phrasings ("이번 달 얼마 썼어?"/"이번 달
+얼마나 샀어?"/"얼마 남았어?"/"이번 달 매수에 쓴 금액 알려줘") — for every one: `price_agent` was
+absent from `agents_used`, no refusal phrasing (checked against a marker list: "담당하지 않"/"재무
+담당자"/"다른 채널"/"제 담당이 아니"/"제공하지 않습니다"/"다른 부서") appeared anywhere in `answer`,
+`plan_agent` correctly stated spend/remaining/budget figures, and the before/after file hashes were
+identical (confirming a pure query makes zero writes). The combined price+spending question ("이번 달
+얼마 썼어? 그리고 BTC 지금 가격도 알려줘") correctly reached both `price_agent` and `plan_agent`, first
+without the cross-agent-boundary fix (reproduced the "지출 내역은 다른 부서에 문의" / "BTC 가격은 제
+담당 범위가 아닙니다" pair described in its own "Key invariants" bullet) and then, after that fix and a
+server restart, with the outright refusal phrasing gone from both sides and only a short non-declining
+cross-reference sentence remaining on each. A pure price question ("BTC 지금 가격 얼마야?") and a pure
+buy-timing/calculation question set were re-checked to confirm `price_agent`-only routing still works
+unaffected. No repeated retries were needed (no rate limiting encountered).
+
+**Full live verification of the greeting/capability-intro and vague-analysis-request fixes (2026-09-20,
+Haiku 4.5, `global.` profile, isolated `BTC_AGENT_DATA_DIR`)** — reproduced the exact screenshots that
+reported both issues: "안녕" and "넌 무슨일을 할수있니" now both return the fixed
+`_CAPABILITY_INTRO_TEXT` with `agents_used == []`; "BTC 분석해줘" and "BTC 현재 상황 알려줘" both
+route to `price_agent` alone and produce a full RSI/MA200/DD/MDD values-plus-meaning answer ending in the
+standard no-composite-verdict disclaimer, matching the already-working "BTC 지표 알려줘"; a genuinely
+unrelated control question ("오늘 날씨 어때?") still received the original generic out-of-scope
+rejection unchanged. No repeated retries were needed.
+
+**Full live verification of the "현재 전략" personal-status fix (2026-09-20, Haiku 4.5, `global.`
+profile, isolated `BTC_AGENT_DATA_DIR`, state seeded to match the reported screenshot exactly)**: "현재
+전략이 뭔지 알려주고, 매수 조건이 충족되었는지 확인해줘" now returns `agents_used == ['plan_agent']`
+only — the correct strategy/condition/budget answer is unchanged, only the extra `research_agent`
+refusal is gone. No repeated retries were needed.
+
+**Full live verification of the BTC-concept routing + relevance-gate fixes (2026-09-20, Haiku 4.5,
+`global.` profile, isolated `BTC_AGENT_DATA_DIR`)**: "BTC가 뭐야"/"비트코인이 뭐야" both now route to
+`research_agent` alone and produce accurate `BTC.md`-grounded explanations; "비트코인 가격 알려줘"
+still routes to `price_agent` alone (routing fix didn't over-reach); "비트코인에 대해 설명해줘" —
+which surfaced the separate relevance-gate bug live, not by inspection — was re-run after the
+`retriever.py` fix and the server restart, and now also returns the full grounded explanation instead of
+the false "not in our docs" claim. No repeated retries were needed.
+
 **Still open / needs a decision**: `evaluation/run_ragas.py` doesn't currently run in this environment
 (ragas 0.3.0 vs. Python 3.14 asyncio incompatibility, not an app bug) — see Commands above and
-`evaluation/round3_report.md` §6.
+`evaluation/round2_report.md#legacy-round3` §6.
 
 ## Data files
 
@@ -814,8 +1435,7 @@ above were re-run end to end with real tool-call traces and file diffs, not just
   content → old content gone from search, new content present; deleted doc → only its chunks removed).
   confusing especially weaker models. Don't reintroduce unconditional `from_documents` here.
 - `evaluation/test_queries.csv` — 22 rows, current tool set, run against the live server (2026-09-17).
-  `evaluation/round{1,2}_report.md` hold old-concept results, now stale; `evaluation/round3_report.md` is
-  current. `evaluation/_eval_seed.py` gives both `run_eval.py`/`llm_as_judge.py` a shared "plan already
+  Submission summaries are in `evaluation/round1_report.md` and `evaluation/round2_report.md`; earlier development results are historical appendices in round2. `evaluation/_eval_seed.py` gives both `run_eval.py`/`llm_as_judge.py` a shared "plan already
   started last month, one buy record exists" precondition (several CSV rows assume this).
   `evaluation/_eval_scratch/` (gitignored) is where those two scripts point `ledger.LEDGER_PATH`/
   `month_state.STATE_PATH` — never point them at the real `data/*.json` (see Commands section above for

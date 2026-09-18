@@ -141,8 +141,8 @@ guardrail 3/3=100%, 당시 pytest 전부 통과). **이건 "당시 기준 목표
 ## 7. 근거와 이력
 
 - [기존 최초 개발 평가 보고서](archive/round1_initial_report.md): 당시 14/20 결과를 원문 보존
-- [개발 round4](round4_report.md): 규칙 평가·LLM-as-Judge·승인·RAG 개선
-- [개발 round5](round5_report.md): RAGAS 세트·실패 문항 재검토
+- [개발 round4](round2_report.md#legacy-round4): 규칙 평가·LLM-as-Judge·승인·RAG 개선
+- [개발 round5](round2_report.md#legacy-round5): RAGAS 세트·실패 문항 재검토
 - [RAGAS 원본 결과](rag_eval_results.json) / [평가 세트](rag_eval_set.json)
 - [모델 비교](model_comparison_report.md) / [개발 상세 보고](../REPORT.md)
 

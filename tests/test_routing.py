@@ -285,6 +285,21 @@ def test_personal_status_query_with_month_does_not_pull_in_research_agent_via_st
         assert "plan_agent" in matched
 
 
+def test_current_strategy_query_without_month_word_does_not_pull_in_research_agent():
+    """실사용 재현(2026-09-20): "현재 전략이 뭔지 알려주고, 매수 조건이 충족되었는지 확인해줘"는
+    "내"/"제"/월 표현 어느 것도 안 써서 위 테스트의 개인 상태 문맥 검사를 못 통과했고, plan_agent가
+    정확히 답한 뒤에도 research_agent가 "개인 상태는 확인할 수 없다"는 불필요한 안내를 덧붙였다.
+    "현재 전략"/"지금 전략"도 "이번 달 전략"과 똑같이 개인 상태 표현으로 인식돼야 한다."""
+    for q in [
+        "현재 전략이 뭔지 알려주고, 매수 조건이 충족되었는지 확인해줘",
+        "지금 전략이 뭐야?",
+        "현재 선택된 전략 알려줘",
+    ]:
+        matched = agent.route_question(q)
+        assert "research_agent" not in matched, f"개인 상태 질문인데 research_agent가 매칭됨: {q!r}"
+        assert "plan_agent" in matched
+
+
 def test_compound_personal_and_concept_question_reaches_both():
     """"내 전략은 뭐고 RSI는 무슨 뜻이야?"처럼 개인 상태와 개념 설명을 함께 묻는 복합 질문은
     두 요구 모두 충족해야 한다 — plan_agent(개인 상태)와 research_agent(RSI 개념 설명) 둘 다."""
@@ -347,3 +362,40 @@ def test_spending_reports_still_reach_ledger_agent_alongside_plan_agent():
     수정의 목적이 아니라, price_agent의 불필요한 거절만 막는 것이 목적)."""
     matched = agent.route_question("이번 달 얼마나 샀어?")
     assert "ledger_agent" in matched
+
+
+# ── 뭉뚱그린 분석 요청 — 실사용 UI 신고(2026-09-20, #5) ──────────────────────
+
+
+def test_general_analysis_requests_reach_price_agent():
+    """"BTC 분석해줘"/"BTC 현재 상황 알려줘"는 같은 뜻인 "BTC 지표 알려줘"(기존에 이미 동작)와
+    달리 위 키워드를 하나도 안 써서 route=[]로 범위 밖 거절됐다. "분석"/"현재 상황"도
+    get_indicators가 답하는 것과 같은 요청이므로 price_agent에 매칭돼야 한다."""
+    for q in ["BTC 분석해줘", "BTC 현재 상황 알려줘", "지금 상황이 어때?"]:
+        matched = agent.route_question(q)
+        assert "price_agent" in matched, f"분석 요청이 price_agent에 안 걸림: {q!r}"
+
+
+# ── "BTC/비트코인이 뭐야" 개념 질문 — 실사용 UI 신고(2026-09-20, #6) ─────────
+
+
+def test_btc_concept_questions_reach_research_agent():
+    """"DCA가 뭐야?"는 "dca"가 이미 research_agent 키워드라 정상 동작하는데, "BTC가 뭐야"/
+    "비트코인이 뭐야"/"비트코인에 대해 설명해줘"는 "btc"/"비트코인"이 어떤 Agent의 키워드에도
+    없어서 range=[]로 거절됐다. data/docs/BTC.md가 이미 있으니 research_agent에 매칭돼야 한다."""
+    for q in ["BTC가 뭐야", "비트코인이 뭐야", "비트코인에 대해 설명해줘", "비트코인 소개해줘", "btc란 무엇인가요"]:
+        matched = agent.route_question(q)
+        assert "research_agent" in matched, f"BTC 개념 질문이 research_agent에 안 걸림: {q!r}"
+
+
+def test_pure_btc_price_or_report_questions_do_not_pull_in_research_agent_via_concept_rule():
+    """"btc"/"비트코인"을 언급하는 모든 문장에서 research_agent를 끌어들이면 안 된다 — 개념을
+    묻는 어미(뭐야/란/설명해줘/소개해줘)가 없는 순수 가격 질문·매수 보고는 이 규칙의 대상이
+    아니다(각각 price_agent·ledger_agent 몫)."""
+    matched = agent.route_question("비트코인 가격 알려줘")
+    assert "research_agent" not in matched
+    assert "price_agent" in matched
+
+    matched2 = agent.route_question("오늘 50만원어치 BTC 매수했어")
+    assert "research_agent" not in matched2
+    assert "ledger_agent" in matched2

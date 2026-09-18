@@ -195,10 +195,25 @@ def _kiwi():
 
 _NOUN_TAGS = {"NNG", "NNP", "NNB", "SL", "SN"}
 
+# 실사용 UI 신고(2026-09-20, #6) 라이브 검증 중 발견: "비트코인에 대해 설명해줘"는 라우팅은
+# 정확했고(research_agent) 임베딩 검색도 BTC.md의 정확한 청크를 실제로 찾았는데도, 모델이
+# retrieve_docs를 "비트코인 개념 정의"라는 자기 나름의 쿼리로 호출하는 바람에 assess_retrieval의
+# 키워드 일치율 게이트에서 걸러졌다 — "개념"/"정의"는 질문이 "무엇을 원하는지"를 나타내는
+# 메타 단어일 뿐 문서 본문에 그 단어 자체가 그대로 나올 이유가 없는데도(예: BTC.md는 "개념"이라는
+# 단어를 안 쓴다), 명사라서 그대로 핵심어 집합에 들어가 일치율 분모를 부풀리고, 결국 진짜 주제어
+# ("비트코인") 하나만 일치해도 40% 문턱을 못 넘겼다. 이런 메타 명사를 핵심어에서 제외해, 게이트가
+# 실제 주제어 일치만으로 판단하게 한다 — 임계값(0.4) 자체를 낮추는 것보다 이쪽이 더 정확하다(진짜
+# 무관한 검색 결과를 걸러내는 능력은 그대로 유지하면서, 이 거짓 음성만 없앤다).
+_QUERY_META_NOUNS = {"개념", "정의", "설명", "소개", "뜻", "의미", "질문", "궁금", "요약", "내용"}
+
 
 def _keywords(text: str) -> set[str]:
-    """텍스트에서 명사류 핵심어만 뽑습니다."""
-    return {t.form for t in _kiwi().tokenize(text) if t.tag in _NOUN_TAGS and len(t.form) > 1}
+    """텍스트에서 명사류 핵심어만 뽑습니다. "개념"/"설명" 같은 질문 형식 메타 단어는 실제 주제어가
+    아니므로 제외합니다(위 주석 참고)."""
+    return {
+        t.form for t in _kiwi().tokenize(text)
+        if t.tag in _NOUN_TAGS and len(t.form) > 1 and t.form not in _QUERY_META_NOUNS
+    }
 
 
 def assess_retrieval(docs, question: str) -> dict:

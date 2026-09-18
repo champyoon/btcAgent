@@ -83,7 +83,7 @@ curl -X POST http://localhost:8000/approve -H "Content-Type: application/json" \
 curl -X POST http://localhost:8000/reject -H "Content-Type: application/json" \
   -d '{"approval_id": "..."}'
 
-# Deterministic calculation tests (no AWS needed, no LLM calls) — 250/250 as of 2026-09-20
+# Deterministic calculation tests (no AWS needed, no LLM calls) — 251/251 as of 2026-09-20
 # UI-interaction tests (separate category, not counted above) — ui/tests/: 34/34 as of 2026-09-20
 python -m pytest tests/ -v
 
@@ -1235,6 +1235,14 @@ Key invariants to preserve when touching this code:
   still correctly yields `usable=False` rather than vacuously passing. Re-verified live end-to-end after
   restarting the server: "비트코인에 대해 설명해줘" now returns the full grounded `BTC.md` explanation
   instead of the false "이 서비스의 문서에는... 담겨 있지 않습니다" claim.
+- **"이력"/"내역" are common synonyms for "기록" that `ledger_agent`'s keyword list simply didn't have**
+  (found via a real screenshot, 2026-09-20). "매수 이력 보여줘" got the generic out-of-scope rejection
+  even though `search_ledger` can answer it — a plain missing-synonym gap, same shape as many other
+  keyword additions in this file, not a design problem. Added "이력"/"내역" to
+  `_AGENT_KEYWORDS["ledger_agent"]`. Verified via `tests/test_routing.py::test_history_synonyms_reach_ledger_agent`
+  (3 phrasings) and live (Haiku 4.5, `global.` profile, state seeded to match the screenshot — budget
+  1,000,000원, RSI selected, one 500,000원 buy approved): "매수 이력 보여줘" now returns the correct
+  record table via `ledger_agent`.
 
 ## How this was verified
 

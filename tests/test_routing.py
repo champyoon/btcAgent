@@ -399,3 +399,15 @@ def test_pure_btc_price_or_report_questions_do_not_pull_in_research_agent_via_co
     matched2 = agent.route_question("오늘 50만원어치 BTC 매수했어")
     assert "research_agent" not in matched2
     assert "ledger_agent" in matched2
+
+
+# ── "이력"/"내역" 동의어 누락 — 실사용 UI 신고(2026-09-20, #7) ───────────────
+
+
+def test_history_synonyms_reach_ledger_agent():
+    """"매수 이력 보여줘"가 "기록"의 동의어인 "이력"/"내역"을 써서 어떤 ledger_agent 키워드와도
+    안 맞아 범위 밖으로 거절됐다 — search_ledger가 이미 답할 수 있는 질문인데 순전히 동의어
+    누락으로 막혔다."""
+    for q in ["매수 이력 보여줘", "거래 이력 알려줘", "매수 내역 보여줘"]:
+        matched = agent.route_question(q)
+        assert "ledger_agent" in matched, f"이력/내역 조회가 ledger_agent에 안 걸림: {q!r}"

@@ -16,11 +16,15 @@ import month_state as ms
 
 
 def test_propose_alone_does_not_start_plan():
+    """2026-09-20 정책 변경: 시작월을 명시하지 않은 최초 설정은 이제 이번 달을 기본으로 제안한다
+    (이전에는 "오늘이 1일이 아니면 무조건 다음 달"이었다 — 월중 이용자를 위해 폐기)."""
     now = datetime(2026, 9, 17, 10, 0, tzinfo=ms.KST)
     proposal = ms.propose_budget_change(2_000_000, now=now)
     assert proposal["ok"]
     assert proposal["is_initial"] is True
-    assert proposal["effective_month"] == "2026-10"
+    assert proposal["action"] == "initial"
+    assert proposal["effective_month"] == "2026-09"
+    assert proposal["month_mismatch"] is False
 
     state = ms.load_state()
     assert state.get("plan_start_month") is None, "제안만으로 계획이 시작되면 안 됨"
@@ -34,8 +38,8 @@ def test_confirm_applies_correct_amount_and_month():
     assert result["ok"]
 
     state = ms.load_state()
-    assert state["plan_start_month"] == "2026-10"
-    assert state["budget_history"] == [{"amount_krw": 2_000_000, "effective_month": "2026-10"}]
+    assert state["plan_start_month"] == "2026-09"
+    assert state["budget_history"] == [{"amount_krw": 2_000_000, "effective_month": "2026-09"}]
 
 
 def test_cancel_leaves_state_unchanged():
@@ -174,8 +178,8 @@ def test_tampered_amount_and_effective_month_are_ignored_at_http_boundary():
     assert resp.status_code == 200
 
     state = ms.load_state()
-    assert state["budget_history"] == [{"amount_krw": 2_000_000, "effective_month": "2026-10"}]
-    assert state["plan_start_month"] == "2026-10"
+    assert state["budget_history"] == [{"amount_krw": 2_000_000, "effective_month": "2026-09"}]
+    assert state["plan_start_month"] == "2026-09"
 
 
 def test_confirm_unknown_token_returns_404_confirm_stale_or_processed_returns_409():

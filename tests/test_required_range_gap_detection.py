@@ -37,11 +37,19 @@ def _remove_middle_day(records: list[dict]) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════
 
 def test_indicators_summary_blocks_on_gap_despite_enough_count():
+    """2026-09-20 정책 변경(RSI·DD·MDD 확장) 이후: RSI/MA200은 결측 때문에 "계산 불가"로
+    막히지만(그 메시지 자체가 "RSI(14)..."라고 어떤 지표가 막혔는지는 명시한다 — 값을
+    내놓지는 않는다는 점이 중요하다), 결측 구간과 겹치지 않는 최근 30일 DD·MDD는 독립적으로
+    계산된다(한 지표의 결측이 다른 지표까지 일괄 차단하지 않는다는 원칙 — tests/test_dd_mdd.py
+    참고)."""
     records = _remove_middle_day(_continuous_records(date(2025, 1, 1), 250))
     assert len(records) >= 200  # 개수 조건 자체는 통과하는 상태
     summary = agent._indicators_summary(records)
     assert "결측" in summary
-    assert "RSI" not in summary  # 계산 결과를 내놓지 않는다
+    assert "RSI(14)·200일 이동평균 괴리율: 계산 불가" in summary
+    # RSI 계산 결과(값·분류)는 내놓지 않는다 — 이름만 언급될 뿐 값은 없어야 한다.
+    assert "중립 구간" not in summary and "과매수 구간" not in summary and "과매도 구간" not in summary
+    assert "최근 30일: DD" in summary  # 결측(2025년 중반)과 안 겹치는 최근 30일은 그대로 계산됨
 
 
 def test_indicators_summary_computes_normally_when_continuous():
@@ -89,7 +97,10 @@ def test_get_indicators_tool_blocks_on_gap_without_hitting_network():
 # record_watch_decision — 관망 스냅샷 경로
 # ══════════════════════════════════════════════════════════════════
 
-def test_watch_decision_snapshot_empty_when_gap_present_but_note_still_recorded():
+def test_watch_decision_snapshot_omits_rsi_but_keeps_independent_dd_when_gap_present():
+    """2026-09-20 정책 변경 이후: 결측 구간 때문에 RSI는 스냅샷에서 비워지지만(잘못된 RSI를
+    남기지 않음), 결측일과 겹치지 않는 최근 30일 DD·MDD는 독립적으로 계산돼 남는다 — 한 지표의
+    결측이 다른 지표까지 일괄로 비우면 안 된다는 원칙(_indicators_summary와 동일)."""
     records = _remove_middle_day(_continuous_records(date(2025, 1, 1), 250))
     original_update = agent.price_history.update_incremental
     original_confirmed = agent.price_history.confirmed_records
@@ -104,7 +115,10 @@ def test_watch_decision_snapshot_empty_when_gap_present_but_note_still_recorded(
     assert "관망 기록 추가" in result  # 관망 결정 자체는 그대로 기록됨(§2-2, 승인 불필요)
     entries = agent.ledger.search_ledger()
     watch = next(e for e in entries if e["type"] == "watch")
-    assert watch["indicators_snapshot"] == {}  # 결측 구간이라 스냅샷은 비워짐(잘못된 RSI를 남기지 않음)
+    snapshot = watch["indicators_snapshot"]
+    assert "rsi14" not in snapshot  # 결측 구간이라 RSI는 비워짐(잘못된 RSI를 남기지 않음)
+    assert snapshot["dd_mdd"]["30d"] is not None  # 최근 30일 창은 결측일과 안 겹쳐 독립적으로 계산
+    assert snapshot["dd_mdd"]["365d"] is None  # 250일뿐이라 365일 구간 자체가 확보 안 됨
 
 
 def test_watch_decision_snapshot_populated_when_continuous():

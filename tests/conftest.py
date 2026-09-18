@@ -18,6 +18,7 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def isolated_data(tmp_path, monkeypatch):
+    import agent
     import approvals
     import ledger
     import month_state as ms
@@ -31,4 +32,11 @@ def isolated_data(tmp_path, monkeypatch):
     ms._PENDING_STRATEGY_CHANGES.clear()
     ms._PENDING_BUDGET_CHANGES.clear()
     ms._CONSUMED_BUDGET_TOKENS.clear()
+    # 후속 입력 상태(awaiting_input, 2026-09-20 추가) — request_monthly_budget_amount를 도구
+    # 함수로 직접 호출하는 테스트가 토큰을 남기면 다음 테스트에 새어나갈 수 있다.
+    agent._PENDING_AWAITING_INPUT.clear()
+    agent._LAST_AWAITING_INPUT = None
+    agent._LAST_BUDGET_PROPOSAL = None
+    agent._LAST_STRATEGY_PROPOSAL = None
+    agent._LAST_DATA_GAP = None
     yield

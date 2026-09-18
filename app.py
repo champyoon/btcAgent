@@ -68,6 +68,11 @@ def _get_supervisor():
 class QueryRequest(BaseModel):
     question: str
     proceed_with_stale_data: bool = False
+    # 후속 입력 상태(awaiting_input, SPEC §2-2, 2026-09-20 추가) — 직전 응답의
+    # awaiting_input.awaiting_input_token을 그대로 실어 보내면, 이번 질문이 그 후속 질문(예: 방금
+    # 물어본 예산 금액)에 대한 답임을 서버가 구조적으로 인식한다. 생략하면(기존 Swagger 단독 질문과
+    # 100% 동일하게) 항상 일반 라우팅만 탄다.
+    awaiting_input_token: str = ""
 
 
 class ApproveRequest(BaseModel):
@@ -115,15 +120,33 @@ def query(req: QueryRequest) -> dict:
     구조화해서 보내세요 — 이 요청들은 금액·적용월을 함께 보내지 않습니다(서버가 제안 시점에 저장해둔
     값만 씁니다).
 
+    awaiting_input이 채워져 있으면(SPEC §2-2, 2026-09-20 추가) 서버가 사용자에게 후속 정보(현재는
+    월 예산 금액)를 물어본 상태입니다. 그 안의 awaiting_input_token을 바로 다음 /query 요청의
+    awaiting_input_token 필드에 그대로 실어 보내면, "200만원"처럼 그 자체로는 어떤 주제 키워드도
+    없는 짧은 답변을 서버가 정확히 그 질문에 대한 답으로 연결합니다. 생략해도 무방합니다(기존
+    단독 질문과 동일하게 동작 — 다만 그 경우 짧은 답변은 일반 라우팅만 타서 범위 밖으로 거절될
+    수 있습니다).
+
+    narrative는 answer와 같은 내용을 담되, 확인/승인이 필요한 항목의 confirmation_token·API 경로
+    안내 문구는 뺀 설명 전용 텍스트입니다(2026-09-20 추가) — UI가 그 안내를 구조화된 필드
+    (budget_change_needs_confirmation 등)로 직접 만든 카드로 대체할 때, answer를 그대로 보여주면
+    카드 내용과 중복 노출되는 문제를 위해 추가했습니다. answer는 하위 호환을 위해 그대로 유지되며,
+    Swagger 등 카드가 없는 클라이언트는 계속 answer만 보고도 전부 확인할 수 있습니다.
+
     Bedrock 호출이 실패해도(쿼터 초과 등) 500을 그대로 노출하지 않고, §4-2 계약 형태를 유지한 채
     사유를 안내합니다 (`error` 필드는 계약 밖 부가 정보).
     """
     try:
-        return _get_supervisor()(req.question, proceed_with_stale_data=req.proceed_with_stale_data)
+        return _get_supervisor()(
+            req.question,
+            proceed_with_stale_data=req.proceed_with_stale_data,
+            awaiting_input_token=req.awaiting_input_token,
+        )
     except Exception as exc:  # noqa: BLE001 — API 경계에서는 어떤 예외든 계약 형태로 감싸 반환합니다.
         kind = _classify_llm_error(exc)
         return {
             "answer": _LLM_ERROR_MESSAGES[kind],
+            "narrative": _LLM_ERROR_MESSAGES[kind],
             "contexts": [],
             "trace": [{"step": "error", "input": req.question, "output": {"kind": kind, "detail": str(exc)}}],
             "error": kind,

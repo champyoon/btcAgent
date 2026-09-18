@@ -54,8 +54,15 @@ def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def init_plan(monthly_budget_krw: float, now: datetime | None = None) -> dict:
-    """§2-0 최초 이용. 오늘이 1일이면 이번 달부터, 아니면 다음 달부터 계획을 시작한다."""
+def init_plan(monthly_budget_krw: float, now: datetime | None = None, start_month: str | None = None) -> dict:
+    """§2-0 최초 이용.
+
+    2026-09-20 정책 변경: 이전에는 "오늘이 1일이면 이번 달부터, 아니면 다음 달부터"만 가능했다
+    (월중 최초 이용자는 무조건 다음 달로 미뤄졌다). 이제 이번 달/다음 달 중 사용자가 확인한 달로
+    직접 시작할 수 있다 — `start_month`("YYYY-MM")을 명시하면 그대로 쓰고(제안→확인 절차에서 이미
+    이번 달/다음 달 중 하나로 검증된 값만 넘어온다, `_budget_plan_snapshot` 참고), 생략하면(직접
+    호출하는 기존 테스트·호출부 호환용) 예전 규칙(오늘이 1일이면 이번 달, 아니면 다음 달)으로
+    계산한다."""
     if monthly_budget_krw <= 0:
         return {"ok": False, "error": "monthly_budget_krw는 양수여야 합니다."}
     now = now or datetime.now(KST)
@@ -63,8 +70,11 @@ def init_plan(monthly_budget_krw: float, now: datetime | None = None) -> dict:
     if state.get("plan_start_month"):
         return {"ok": False, "error": "이미 초기화된 계획이 있습니다(월 예산 변경은 set_monthly_budget 사용)."}
 
-    start_key = (now.year, now.month) if now.day == 1 else _next_month((now.year, now.month))
-    start_str = _month_str(*start_key)
+    if start_month:
+        start_str = start_month
+    else:
+        start_key = (now.year, now.month) if now.day == 1 else _next_month((now.year, now.month))
+        start_str = _month_str(*start_key)
     state["plan_start_month"] = start_str
     state["budget_history"] = [{"amount_krw": monthly_budget_krw, "effective_month": start_str}]
     state.setdefault("months", {})
@@ -107,43 +117,118 @@ _PENDING_BUDGET_CHANGES: dict[str, dict] = {}
 _CONSUMED_BUDGET_TOKENS: dict[str, str] = {}
 
 
-def _budget_plan_snapshot(now: datetime, state: dict) -> dict:
-    """최초 설정인지 변경인지, 적용월이 언제인지를 §2-0/§4 규칙 그대로 계산한다. propose 때와
-    confirm 때 각각 다시 호출해서 그 사이 시점이 달라졌는지(예: 월 경계를 넘김) 비교하는 데 쓴다."""
+def _budget_plan_snapshot(now: datetime, state: dict, requested_month: str | None = None) -> dict:
+    """예산 제안이 세 가지 중 어느 동작인지, 적용월이 언제인지를 계산한다. propose 때와 confirm
+    때 각각 다시 호출해서 그 사이 시점이 달라졌는지(예: 월 경계를 넘김) 비교하는 데 쓴다.
+
+    2026-09-20 정책 변경(월중에도 이번 달부터 DCA 시작 지원) — 세 가지 동작:
+    - **"initial"**: 계획이 아예 없다(`plan_start_month`가 None). 이번 달 또는 다음 달 중
+      선택할 수 있다 — `requested_month`가 그 둘 중 하나면 그대로, 없으면 **이번 달을 기본으로
+      제안한다**(이전에는 "오늘이 1일이 아니면 무조건 다음 달"이었다 — 이번 정책 변경으로 폐기).
+      그 둘이 아닌 달을 요청했으면(과거 달 포함) 이번 달로 대체하고 `month_mismatch`를 True로
+      남긴다 — 조용히 다른 달로 바꾸지 않고 그 사실을 구조화된 필드로 알린다.
+    - **"advance"**: 계획은 있지만 아직 시작되지 않았고(`plan_start_month`가 이번 달보다 미래),
+      사용자가 정확히 "이번 달"을 요청했다 — 아직 시작 안 한 계획의 시작월을 이번 달로 앞당기는
+      경우다(§2). 기존에 설정된 미래 시작월의 예산 항목은 이 계산만으로는 건드리지 않는다
+      (`advance_plan_start`가 실제로 반영할 때 보존한다).
+    - **"change"**: 그 외 전부(계획이 이미 시작됐거나, 아직 시작 전이지만 이번 달로 당기라는
+      요청이 아닌 경우) — 기존 §4 규칙 그대로 **항상 다음 달부터** 적용한다.
+    """
     plan_start = state.get("plan_start_month")
-    is_initial = plan_start is None
-    if is_initial:
-        start_key = (now.year, now.month) if now.day == 1 else _next_month((now.year, now.month))
-        effective_month = _month_str(*start_key)
-    else:
-        effective_month = _month_str(*_next_month((now.year, now.month)))
-    return {"is_initial": is_initial, "effective_month": effective_month}
+    this_month = _month_str(now.year, now.month)
+    next_month = _month_str(*_next_month((now.year, now.month)))
+
+    if plan_start is None:
+        allowed = {this_month, next_month}
+        if requested_month and requested_month in allowed:
+            effective_month = requested_month
+            mismatch = False
+        else:
+            effective_month = this_month
+            mismatch = bool(requested_month)  # 뭔가 요청했는데 허용 범위 밖이었다
+        return {"action": "initial", "is_initial": True, "effective_month": effective_month, "month_mismatch": mismatch}
+
+    if plan_start > this_month and requested_month == this_month:
+        prev_amount = effective_budget_for(*(int(x) for x in plan_start.split("-")), state)
+        return {
+            "action": "advance",
+            "is_initial": False,
+            "effective_month": this_month,
+            "month_mismatch": False,
+            "previous_start_month": plan_start,
+            "previous_start_amount": prev_amount,
+        }
+
+    mismatch = bool(requested_month) and requested_month != next_month
+    return {"action": "change", "is_initial": False, "effective_month": next_month, "month_mismatch": mismatch}
 
 
-def propose_budget_change(amount_krw: float, now: datetime | None = None) -> dict:
-    """1단계: 실제로 반영하지 않고 제안만 만든다. 제안 시점의 계획 상태(스냅샷)를 함께 저장해
-    confirm 시점에 "그 사이 다른 변경으로 낡은 제안이 됐는지" 비교할 수 있게 한다."""
+def advance_plan_start(amount_krw: float, new_start_month: str, now: datetime | None = None) -> dict:
+    """§2: 아직 시작하지 않은(미래 시작월로 예약된) 계획의 시작월을 이번 달로 앞당긴다.
+
+    기존에 설정돼 있던 미래 시작월의 예산 항목은 **그대로 보존**한다(삭제·이번 달로 복사 둘 다
+    하지 않는다) — 새 시작월(이번 달)에 대한 예산 항목만 새로 추가한다. 실제 매수 기록·전략
+    선택에는 손대지 않는다(이 함수가 건드리는 건 plan_start_month와 budget_history뿐이다)."""
     if amount_krw <= 0:
         return {"ok": False, "error": "amount_krw는 양수여야 합니다."}
     now = now or datetime.now(KST)
     state = load_state()
-    calc = _budget_plan_snapshot(now, state)
-    token = uuid.uuid4().hex
-    with _BUDGET_LOCK:
-        _PENDING_BUDGET_CHANGES[token] = {
-            "amount_krw": amount_krw,
-            "effective_month": calc["effective_month"],
-            "is_initial": calc["is_initial"],
-            "snapshot_plan_start_month": state.get("plan_start_month"),
-            "snapshot_budget_history": list(state.get("budget_history", [])),
-        }
+    plan_start = state.get("plan_start_month")
+    this_month = _month_str(now.year, now.month)
+    if not plan_start:
+        return {"ok": False, "error": "아직 시작된 계획이 없습니다(init_plan이 먼저 필요합니다)."}
+    if plan_start <= this_month:
+        return {"ok": False, "error": "이미 시작된 계획입니다 — 앞당길 대상인 미래 시작월이 없습니다."}
+    if new_start_month != this_month:
+        return {"ok": False, "error": "시작월은 이번 달로만 앞당길 수 있습니다."}
+
+    previous_start_month = plan_start
+    state["plan_start_month"] = new_start_month
+    history = state.setdefault("budget_history", [])
+    history[:] = [h for h in history if h["effective_month"] != new_start_month]  # 재확인 대비 — 이번 달 항목만 교체
+    history.append({"amount_krw": amount_krw, "effective_month": new_start_month})
+    history.sort(key=lambda h: h["effective_month"])
+    save_state(state)
     return {
         "ok": True,
-        "confirmation_token": token,
+        "plan_start_month": new_start_month,
         "amount_krw": amount_krw,
+        "previous_start_month": previous_start_month,
+    }
+
+
+def propose_budget_change(amount_krw: float, requested_month: str | None = None, now: datetime | None = None) -> dict:
+    """1단계: 실제로 반영하지 않고 제안만 만든다. 제안 시점의 계획 상태(스냅샷)를 함께 저장해
+    confirm 시점에 "그 사이 다른 변경으로 낡은 제안이 됐는지" 비교할 수 있게 한다.
+
+    requested_month("YYYY-MM"): 사용자가 "9월부터 시작할게"/"9월 예산은 200만원으로 할게"처럼
+    특정 월을 명시했을 때 그 달을 받는다. 실제 동작(초기 설정/앞당기기/변경)과 적용월은
+    `_budget_plan_snapshot`이 결정한다 — 요청 월이 그대로 받아들여지지 않으면(과거 달 등)
+    `month_mismatch`가 True로 돌아온다. 이 사실을 자유 서술에만 맡기면 예산 제안이 있을 때
+    plan_agent의 텍스트 자체가 최종 답변에서 빠지므로(_build_final_answer의 구조적 제외,
+    agent.py 참고) 이유가 통째로 사라진다 — 그래서 반환값에 구조화된 필드로 담아 agent.py가
+    최종 답변 요약 블록에 직접 반영하게 한다."""
+    if amount_krw <= 0:
+        return {"ok": False, "error": "amount_krw는 양수여야 합니다."}
+    now = now or datetime.now(KST)
+    state = load_state()
+    calc = _budget_plan_snapshot(now, state, requested_month=requested_month)
+    token = uuid.uuid4().hex
+    pending = {
+        "amount_krw": amount_krw,
+        "action": calc["action"],
         "effective_month": calc["effective_month"],
         "is_initial": calc["is_initial"],
+        "requested_month": requested_month,
+        "month_mismatch": calc["month_mismatch"],
+        "previous_start_month": calc.get("previous_start_month"),
+        "previous_start_amount": calc.get("previous_start_amount"),
+        "snapshot_plan_start_month": state.get("plan_start_month"),
+        "snapshot_budget_history": list(state.get("budget_history", [])),
     }
+    with _BUDGET_LOCK:
+        _PENDING_BUDGET_CHANGES[token] = pending
+    return {"ok": True, "confirmation_token": token, **{k: v for k, v in pending.items() if not k.startswith("snapshot_")}}
 
 
 def confirm_budget_change(confirmation_token: str, now: datetime | None = None) -> dict:
@@ -170,8 +255,8 @@ def confirm_budget_change(confirmation_token: str, now: datetime | None = None) 
                 "stale": True,
             }
 
-        calc_now = _budget_plan_snapshot(now, state)
-        if calc_now["is_initial"] != pending["is_initial"] or calc_now["effective_month"] != pending["effective_month"]:
+        calc_now = _budget_plan_snapshot(now, state, requested_month=pending.get("requested_month"))
+        if calc_now["action"] != pending["action"] or calc_now["effective_month"] != pending["effective_month"]:
             del _PENDING_BUDGET_CHANGES[confirmation_token]
             _CONSUMED_BUDGET_TOKENS[confirmation_token] = "stale"
             return {
@@ -182,8 +267,10 @@ def confirm_budget_change(confirmation_token: str, now: datetime | None = None) 
 
         del _PENDING_BUDGET_CHANGES[confirmation_token]
         _CONSUMED_BUDGET_TOKENS[confirmation_token] = "confirmed"
-        if pending["is_initial"]:
-            return init_plan(pending["amount_krw"], now=now)
+        if pending["action"] == "initial":
+            return init_plan(pending["amount_krw"], now=now, start_month=pending["effective_month"])
+        if pending["action"] == "advance":
+            return advance_plan_start(pending["amount_krw"], pending["effective_month"], now=now)
         return set_monthly_budget(pending["amount_krw"], now=now)
 
 

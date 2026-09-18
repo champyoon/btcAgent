@@ -171,3 +171,179 @@ def test_budget_decision_plain_declarative_endings_reach_plan_agent():
     for q in phrasings:
         matched = agent.route_question(q)
         assert "plan_agent" in matched, f"예산 결정 평서형 표현이 plan_agent에 안 걸림: {q!r}"
+
+
+def test_pure_budget_amount_question_does_not_reach_price_agent():
+    """실사용 UI 신고(2026-09-20, #2): "10월 예산은 얼마야?"가 "얼마"(price_agent)와
+    "예산"(plan_agent) 둘 다 매칭돼, plan_agent의 정상적인 예산 조회 답변 옆에 price_agent의
+    무관한 거절 문장이 함께 떴다. "예산" 문맥에서의 "얼마"는 price_agent를 끌어들이지 않아야
+    한다 — 단, 같은 질문에 가격을 가리키는 다른 단어(가격/시세/현재가/btc)가 있으면 그대로 둘 다
+    매칭돼야 한다(복합 조회)."""
+    for q in ["10월 예산은 얼마야?", "이번 달 예산 얼마 남았어?", "다음 달 예산이 얼마로 잡혀있어?"]:
+        matched = agent.route_question(q)
+        assert "plan_agent" in matched, f"예산 조회 질문이 plan_agent에 안 걸림: {q!r}"
+        assert "price_agent" not in matched, f"순수 예산 조회 질문인데 price_agent까지 매칭됨: {q!r}"
+
+
+def test_pure_price_amount_question_still_reaches_price_agent():
+    """위 수정이 "얼마가 들어간 모든 질문"을 price_agent에서 빼는 쪽으로 번지지 않았는지 확인 —
+    "예산" 문맥이 전혀 없는 순수 가격 질문은 그대로 price_agent에 매칭돼야 한다."""
+    for q in ["BTC 현재가는 얼마야?", "지금 얼마야?", "BTC 1만원이면 얼마나 살 수 있어?"]:
+        matched = agent.route_question(q)
+        assert "price_agent" in matched, f"순수 가격 질문이 price_agent에 안 걸림: {q!r}"
+
+
+def test_combined_budget_and_price_question_reaches_both_agents():
+    """"10월 예산과 BTC 현재가 알려줘"처럼 예산·가격을 함께 묻는 복합 질문은 두 Agent 모두에게
+    가야 한다 — 예산 문맥이 있다고 무조건 price_agent를 빼면 이 복합 질문이 깨진다."""
+    matched = agent.route_question("10월 예산과 BTC 현재가 알려줘")
+    assert "plan_agent" in matched
+    assert "price_agent" in matched
+
+
+# ── 전략 선택 의도 라우팅 — 실사용 신고(2026-09-20, #1) ─────────────────────
+
+
+def test_strategy_decision_phrasings_reach_plan_agent():
+    """"RSI매수로 할게"가 price_agent/research_agent(둘 다 "rsi" 키워드)에만 걸리고 plan_agent는
+    안 걸려 전략 변경 제안·확인 카드가 아예 안 만들어졌다. 전략 이름 + 결정 어미 조합이면
+    plan_agent도 매칭돼야 한다."""
+    phrasings = [
+        "RSI매수 로 할게",
+        "RSI로 할래",
+        "RSI 방식으로 바꿔줘",
+        "하락일로 바꿀래",
+        "정기 분할로 정할래",
+    ]
+    for q in phrasings:
+        matched = agent.route_question(q)
+        assert "plan_agent" in matched, f"전략 선택 의도가 plan_agent에 안 걸림: {q!r}"
+
+
+def test_strategy_name_alone_without_decision_word_does_not_reach_plan_agent_via_this_rule():
+    """전략 이름만 있고 결정 어미가 없는 순수 설명/조회 질문은 이 새 규칙으로 plan_agent에
+    매칭되면 안 된다(다른 키워드로 매칭되는 것은 별개) — "RSI가 뭐야?"/"지금 RSI 얼마야?"는
+    plan_agent와 무관한 질문이다."""
+    for q in ["RSI가 뭐야?", "지금 RSI 얼마야?"]:
+        matched = agent.route_question(q)
+        assert "plan_agent" not in matched, f"설명/조회 질문인데 plan_agent가 매칭됨: {q!r}"
+
+
+def test_strategy_negation_does_not_reach_plan_agent_via_decision_rule():
+    """"RSI로 바꾸지 마"는 부정형이라 긍정 결정 어미("바꿔줘"/"바꿀래" 등)와 문자열이 안 맞아
+    plan_agent가 매칭되면 안 된다 — 매칭 자체가 안 되므로 변경 제안도 생기지 않는다."""
+    matched = agent.route_question("RSI로 바꾸지 마")
+    assert "plan_agent" not in matched
+
+
+# ── 실제 매수 보고 라우팅 — 실사용 신고(2026-09-20, #2) ─────────────────────
+
+
+def test_past_tense_buy_reports_reach_ledger_agent():
+    """"오늘 50만원어치 BTC 매수했어"가 "기록"/"매수해줘"(명령형) 어느 것과도 안 맞아(과거 시제
+    보고문) 범위 밖으로 거절됐다. 실제 매수 사실을 보고하는 표현은 ledger_agent에 매칭돼야 한다."""
+    phrasings = [
+        "오늘 50만원어치 BTC 매수했어",
+        "오늘 BTC 50만원 샀어",
+        "비트코인 50만 원어치 구매했어",
+        "오늘 산 비트코인 기록해줘",
+    ]
+    for q in phrasings:
+        matched = agent.route_question(q)
+        assert "ledger_agent" in matched, f"매수 보고 표현이 ledger_agent에 안 걸림: {q!r}"
+
+
+def test_calculation_and_decision_help_questions_do_not_reach_ledger_agent():
+    """"50만원 사면 얼마나 돼?"(계산)·"50만원 살까?"(판단 보조)는 실제 매수 보고가 아니므로
+    ledger_agent에 매칭되면 안 된다 — 각각 price_agent 몫이다."""
+    for q in ["50만원 사면 얼마나 돼?", "50만원 살까?"]:
+        matched = agent.route_question(q)
+        assert "ledger_agent" not in matched, f"계산/판단 질문인데 ledger_agent가 매칭됨: {q!r}"
+        assert "price_agent" in matched
+
+
+def test_investing_verb_variants_of_buy_report_reach_ledger_agent():
+    """test_queries.csv 최종 검증 중 발견(2026-09-20): "오늘 정기 매수로 100만원 넣었어"는
+    "매수했어"/"샀어"/"구매했어" 중 어느 것도 안 써서(실제 evaluation/run_eval.py 실행에서
+    "기록" 키워드 덕에 우연히 라우팅은 됐지만) "넣었어"/"투자했어" 단독으로는 어느 키워드와도
+    안 맞을 뻔했다. 구어체 투자 표현도 ledger_agent에 매칭돼야 한다."""
+    for q in ["오늘 100만원 넣었어", "이번 달 100만원 투자했어", "오늘 정기 매수로 100만원 넣었어 기록해줘"]:
+        matched = agent.route_question(q)
+        assert "ledger_agent" in matched, f"구어체 매수 보고 표현이 ledger_agent에 안 걸림: {q!r}"
+
+
+# ── 개인 상태 vs 전략 개념 설명 — 실사용 신고(2026-09-20, #3) ────────────────
+
+
+def test_personal_status_query_with_month_does_not_pull_in_research_agent_via_strategy_keyword():
+    """"9월의 예산과 전략을 알려줘"에서 "전략"이 research_agent의 일반 키워드와 겹쳐, plan_agent가
+    이미 답한 뒤에도 research_agent가 불필요한 안내를 덧붙였다. 특정 월을 콕 집은 개인 상태
+    질문에서는 "전략"만으로 research_agent가 매칭되면 안 된다."""
+    for q in ["9월의 예산과 전략을 알려줘", "다음 달 전략 뭐야?", "이번 달 전략 알려줘"]:
+        matched = agent.route_question(q)
+        assert "research_agent" not in matched, f"개인 상태 질문인데 research_agent가 매칭됨: {q!r}"
+        assert "plan_agent" in matched
+
+
+def test_compound_personal_and_concept_question_reaches_both():
+    """"내 전략은 뭐고 RSI는 무슨 뜻이야?"처럼 개인 상태와 개념 설명을 함께 묻는 복합 질문은
+    두 요구 모두 충족해야 한다 — plan_agent(개인 상태)와 research_agent(RSI 개념 설명) 둘 다."""
+    matched = agent.route_question("내 전략은 뭐고 RSI는 무슨 뜻이야?")
+    assert "plan_agent" in matched
+    assert "research_agent" in matched
+
+
+def test_general_strategy_concept_questions_still_reach_research_agent():
+    """개인 상태 문맥(특정 월·소유격)이 없는 일반적인 전략 개념 질문은 기존처럼 research_agent에
+    매칭돼야 한다 — 이번 수정이 "전략"이 들어간 모든 질문에서 research_agent를 빼는 쪽으로
+    번지면 안 된다."""
+    for q in ["하락일 매수 조건이 뭐야?", "전략이 뭐가 있어?"]:
+        matched = agent.route_question(q)
+        assert "research_agent" in matched, f"일반 전략 질문인데 research_agent가 안 걸림: {q!r}"
+
+
+# ── "예산" 없는 사용액·잔여액 조회 — 실사용 재현(2026-09-20, #4) ─────────────
+
+
+def test_spending_query_without_budget_word_reaches_plan_agent_not_price_agent():
+    """"이번 달 얼마 썼어?"가 "얼마"(price_agent)만 걸리고 "예산" 문맥 검사는 통과 못 해(단어
+    자체가 없음), plan_agent의 정확한 사용액·잔여 예산 답변 옆에 price_agent의 "개인 지출은
+    담당하지 않는다"류 무관한 거절이 함께 떴다. "예산"이라는 단어 없이도 사용액·잔여액을 묻는
+    질문(썼어/샀어/구매했어/지출/쓴 금액/남았어)은 plan_agent에만 매칭되고 price_agent는 빠져야
+    한다."""
+    phrasings = [
+        "이번 달 얼마 썼어?",
+        "이번 달 얼마나 샀어?",
+        "얼마 남았어?",
+        "이번 달 매수에 쓴 금액 알려줘",
+    ]
+    for q in phrasings:
+        matched = agent.route_question(q)
+        assert "plan_agent" in matched, f"사용액·잔여액 조회 질문이 plan_agent에 안 걸림: {q!r}"
+        assert "price_agent" not in matched, f"사용액 조회 질문인데 price_agent까지 매칭됨: {q!r}"
+
+
+def test_pure_price_and_calc_questions_still_reach_price_agent_after_spending_fix():
+    """위 수정이 "얼마"가 들어간 모든 질문에서 price_agent를 빼는 쪽으로 번지지 않았는지 확인 —
+    사용액 문맥이 전혀 없는 순수 가격/계산 질문은 그대로 price_agent에 매칭돼야 한다."""
+    for q in ["BTC 현재가는 얼마야?", "BTC 1만원이면 얼마나 살 수 있어?", "50만원 사면 얼마나 돼?"]:
+        matched = agent.route_question(q)
+        assert "price_agent" in matched, f"순수 가격/계산 질문이 price_agent에 안 걸림: {q!r}"
+
+
+def test_combined_spending_and_price_question_reaches_both_agents():
+    """사용액과 가격을 함께 묻는 복합 질문("이번 달 얼마 썼어? 그리고 BTC 지금 가격도 알려줘")은
+    가격 문맥 단어(가격/시세/현재가/btc)가 있으니 기존처럼 두 Agent 모두에게 가야 한다 — 사용액
+    문맥이 있다고 무조건 price_agent를 빼면 이 복합 질문이 깨진다."""
+    matched = agent.route_question("이번 달 얼마 썼어? 그리고 BTC 지금 가격도 알려줘")
+    assert "plan_agent" in matched
+    assert "price_agent" in matched
+
+
+def test_spending_reports_still_reach_ledger_agent_alongside_plan_agent():
+    """"이번 달 얼마나 샀어?"/"이번 달 매수에 쓴 금액 알려줘"는 실제 매수 기록(ledger_agent 몫)도
+    함께 확인할 만한 질문이라, plan_agent 외에 ledger_agent가 추가로 매칭되는 것 자체는 문제가
+    아니다 — 이 테스트는 그 매칭이 여전히 유지되는지만 확인한다(중복 매칭 자체를 막는 게 이번
+    수정의 목적이 아니라, price_agent의 불필요한 거절만 막는 것이 목적)."""
+    matched = agent.route_question("이번 달 얼마나 샀어?")
+    assert "ledger_agent" in matched

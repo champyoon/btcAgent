@@ -76,25 +76,30 @@ def _shift_months(d: date, months: int) -> date:
     return date(y, m, day)
 
 
-def compute_drawdown(
+#: DD·MDD 계산 기준 버전 — 정책이 바뀌면 이 문자열도 새로 발급한다(§6-2, 2026-09-20 정책
+#: 변경으로 "close_v1" 도입). 과거 관망 스냅샷(indicators_snapshot)에는 이 키 자체가 없으므로
+#: "키가 없으면 구 기준(고가 기준) 또는 DD·MDD 미포함"이라는 뜻으로 자연스럽게 구분된다.
+DD_MDD_CALC_BASIS = "close_v1"
+
+
+def _window_for_period(
     candles: list[dict], *, days: int | None = None, months: int | None = None
-) -> dict | None:
-    """§6-2 확정 드로다운. candles는 과거 -> 최신 [{date_kst, high, close}, ...], **확정 데이터만**
-    (당일 진행 중 캔들은 호출 전에 걸러야 한다 — price_history.confirmed_records).
+) -> tuple[list[dict], date, date] | None:
+    """DD·MDD가 공유하는 구간 추출 — candles는 과거 -> 최신 [{date_kst, close}, ...], **확정
+    데이터만**(당일 진행 중 캔들은 호출 전에 걸러야 한다 — price_history.confirmed_records).
 
     `days` 또는 `months` 중 정확히 하나를 지정한다:
       - 1개월 = days=30 (D-29 ~ D, 양끝 포함)
       - 1년   = days=365 (D-364 ~ D, 양끝 포함)
       - 4년   = months=48 (D에서 달력상 48개월 뺀 날짜의 다음날 ~ D, 양끝 포함)
 
-    구간 내 단 하루라도 일봉이 없으면(캐시 누락) None을 반환한다 — 임의로 기간을 늘리거나 채우지
-    않는다. 최고 고가(high) 기준·최신 확정 종가(close) 기준으로
-    `(최신 확정 종가 / 기간 내 최고 고가 - 1) × 100`을 계산한다(기간 전체 MDD와는 다른 개념).
+    구간 내 단 하루라도 일봉이 없으면(캐시 누락이든, 애초에 그만큼의 과거 데이터가 없든) None을
+    반환한다 — 임의로 기간을 늘리거나 짧은 구간으로 대체하지 않는다.
     """
     if not candles:
         return None
     if (days is None) == (months is None):
-        raise ValueError("compute_drawdown: days와 months 중 정확히 하나만 지정해야 한다")
+        raise ValueError("_window_for_period: days와 months 중 정확히 하나만 지정해야 한다")
 
     end = candles[-1]
     end_date = date.fromisoformat(end["date_kst"])
@@ -113,25 +118,70 @@ def compute_drawdown(
     for _ in range(total_days):
         c = by_date.get(cursor.isoformat())
         if c is None:
-            return None  # 구간 내 누락 일봉 — 늘리거나 채우지 않고 계산 불가로 처리(§6-2)
+            return None  # 구간 내 누락(또는 그만큼의 과거 데이터 자체가 없음) — 계산 불가(§6-2)
         window.append(c)
         cursor += timedelta(days=1)
+    return window, expected_start, end_date
 
-    high_candle = max(window, key=lambda c: c["high"])
-    high = high_candle["high"]
-    if high == 0:
+
+def compute_dd_mdd(
+    candles: list[dict], *, days: int | None = None, months: int | None = None
+) -> dict | None:
+    """§6-2(2026-09-20 정책 변경) 확정 DD·MDD — **둘 다 확정 종가(close) 기준으로 통일**한다.
+    기존에는 DD를 최고 고가(high) 기준으로 계산했다 — 그 기준은 폐기됐다. `high` 필드는 이제 이
+    함수에서 전혀 읽지 않는다.
+
+    DD(현재 하락률, %) = (최신 확정 종가 / 기간 내 최고 종가 - 1) × 100
+    MDD(최대 낙폭, %) = 날짜순으로 그 시점까지의 최고 종가 대비 각 시점 낙폭 중 최솟값 — 반드시
+    고점 이후에 발생한 저점만 반영한다(단순 기간 전체 최저가/최고가 비교가 아니다). 상승만 한
+    구간·횡보 구간의 MDD는 0%. 둘 다 0 이하의 부호 있는 백분율로, 항상 MDD ≤ DD ≤ 0이다(DD도
+    같은 러닝 최고 종가로 계산되는 마지막 시점의 낙폭이므로).
+
+    구간 내 결측 일봉이 있거나(그만큼의 과거 데이터 자체가 없어도 마찬가지), 구간 내 종가가 0
+    이하인 값이 있으면 None — 임의로 기간을 줄이거나 값을 추정해 채우지 않는다.
+    """
+    extracted = _window_for_period(candles, days=days, months=months)
+    if extracted is None:
         return None
+    window, start_date, end_date = extracted
+
+    peak_close: float | None = None
+    peak_date: str | None = None
+    mdd_pct: float | None = None
+    mdd_peak_close: float | None = None
+    mdd_peak_date: str | None = None
+    mdd_trough_close: float | None = None
+    mdd_trough_date: str | None = None
+
+    for c in window:
+        close = c["close"]
+        if close <= 0:
+            return None  # 유효하지 않은 가격 — 계산 불가
+        if peak_close is None or close > peak_close:
+            peak_close = close
+            peak_date = c["date_kst"]
+        dd_at_t = (close / peak_close - 1) * 100
+        if mdd_pct is None or dd_at_t < mdd_pct:
+            mdd_pct = dd_at_t
+            mdd_peak_close = peak_close
+            mdd_peak_date = peak_date
+            mdd_trough_close = close
+            mdd_trough_date = c["date_kst"]
+
+    end_close = window[-1]["close"]
+    dd_pct = (end_close / peak_close - 1) * 100
+
     return {
-        "pct": (end["close"] / high - 1) * 100,
-        "start_date": expected_start.isoformat(),
+        "calc_basis": DD_MDD_CALC_BASIS,
+        "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
-        "high": high,
-        # 2026-09-19 추가: 실사용 중 발견 — 이전에는 구간 내 최고가(high)만 반환하고 그 최고가가
-        # "언제" 찍혔는지는 버리고 있었다. 그러자 이 값을 답변 문구로 옮기는 쪽(agent.py:_dd_desc)이
-        # "(구간 시작일~종료일 고점 X원 대비)"처럼 구간 범위만 보여줬는데, 실제 Haiku 응답에서
-        # "1년: 179,869,000원 대비(작년 9월 17일 고점)"처럼 구간 시작일을 고점 발생일로 잘못
-        # 서술하는 결과가 나왔다 — 실제 고점은 그 약 3주 뒤(2025-10-09)였다. 최고가가 찍힌 실제
-        # 날짜를 도구 결과 자체에 포함시켜, 답변을 만드는 쪽이 추측하지 않고 이 값을 그대로 쓰게 한다.
-        "high_date": high_candle["date_kst"],
-        "close": end["close"],
+        "end_close": end_close,
+        "dd_pct": dd_pct,
+        "dd_peak_close": peak_close,
+        "dd_peak_date": peak_date,
+        "mdd_pct": mdd_pct,
+        "mdd_peak_close": mdd_peak_close,
+        "mdd_peak_date": mdd_peak_date,
+        "mdd_trough_close": mdd_trough_close,
+        "mdd_trough_date": mdd_trough_date,
     }

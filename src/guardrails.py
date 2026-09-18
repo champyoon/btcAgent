@@ -481,6 +481,12 @@ RISK_LEVELS: dict[str, str] = {
     "get_btc_price": "read",
     "get_indicators": "read",
     "get_month_status": "read",
+    # 2026-09-20 추가(실사용 UI 신고 #1 대응): 아무 상태도 실제로 바꾸지 않는, "다음 메시지를
+    # 기다린다"는 내부 신호만 남기는 도구다(agent.py의 request_monthly_budget_amount 참고) —
+    # get_month_status와 같은 순수 조회 성격이라 "read"다. 등록을 빠뜨리면 미등록 도구 기본값(모르는
+    # 것은 막는다)이 적용돼 승인 대기로 잘못 멈춘다 — 실제로 이 배포에서 한 번 그렇게 됐었다(라이브
+    # 검증 중 발견·즉시 수정, REPORT.md 참고).
+    "request_monthly_budget_amount": "read",
     "set_monthly_budget": "read",  # 사용자가 명시한 설정값 변경일 뿐 자금 이동이 없어 select_strategy와
     # 같은 성격으로 취급한다 — 2026-09-18(SPEC §4-2)부터 select_strategy와 동일하게 propose/confirm
     # 토큰(month_state._PENDING_BUDGET_CHANGES, /confirm_budget_change·/cancel_budget_change)을
@@ -498,6 +504,12 @@ RISK_LEVELS: dict[str, str] = {
     # 매번 즉시 실행되는 도구다. "read"가 아닌 다른 값(또는 미등록)으로 두면 표준 게이트가 끼어들어
     # 이 전용 확인 절차와 이중으로 겹치게 된다.
     "select_strategy": "read",
+    # 2026-09-20 추가(실사용 신고 #2 대응): request_monthly_budget_amount와 같은 이유로 "read"다 —
+    # 아무 상태도 바꾸지 않는 순수 신호 도구이며, 등록을 빠뜨리면 §20-1에서 실제로 겪은 것과 똑같이
+    # 미등록 도구 기본값(승인 필요) 때문에 승인 대기로 잘못 멈춘다. 실제 기록은 여전히
+    # record_virtual_buy(아래, write)가 담당하고 승인을 그대로 거친다 — 이 도구는 그 전 단계의
+    # "무엇을 물어야 하는지" 신호일 뿐이다.
+    "request_buy_execution_detail": "read",
     "record_virtual_buy": "write",
     "amend_virtual_buy": "write",
     "cancel_virtual_buy": "write",

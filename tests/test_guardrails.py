@@ -66,3 +66,15 @@ def test_needs_approval_risk_levels():
     assert guardrails.needs_approval("reset_ledger", {})[0] is True
     assert guardrails.needs_approval("select_strategy", {})[0] is False  # §14-0: 표준 게이트 대상 아님
     assert guardrails.needs_approval("unknown_tool_xyz", {})[0] is True  # 미등록 도구는 안전하게 승인 필요
+
+
+def test_every_tool_agent_py_registers_has_a_risk_level():
+    """실사용 신고 회귀(2026-09-20): 새 도구(request_monthly_budget_amount)를 agent.py에 추가하며
+    RISK_LEVELS 등록을 빠뜨려, "미등록 도구는 안전하게 승인 필요" 기본값이 적용되는 바람에 아무
+    상태도 안 바꾸는 순수 신호 도구가 실 /query에서 승인 대기로 멈춰버렸다(라이브 검증 중 발견).
+    agent.py가 실제로 등록한 모든 도구 이름이 guardrails.RISK_LEVELS에도 있는지 항상 확인한다 —
+    새 도구를 추가할 때 이 등록을 또 빠뜨리면 이 테스트가 즉시 알려준다."""
+    import agent
+
+    missing = [name for name in agent._TOOL_REGISTRY if name not in guardrails.RISK_LEVELS]
+    assert not missing, f"RISK_LEVELS에 등록되지 않은 도구(미등록 시 항상 승인 필요로 처리됨): {missing}"

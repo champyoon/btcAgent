@@ -750,7 +750,13 @@ _AGENT_SYSTEM_PROMPTS = {
         "get_indicators로 답하세요 — '분석'이라는 단어가 종합 판정을 요구하는 것처럼 들려도, "
         "이 서비스의 답은 항상 'RSI·이동평균·DD·MDD 각각의 값과 의미'입니다. 이 요청에서도 "
         "종합 매수 등급이나 '사도 된다/기다려라' 같은 판단을 내리지 마세요 — 위 문단과 동일한 "
-        "원칙입니다."
+        "원칙입니다.\n\n"
+        "중요 — 시뮬레이션/백테스트 요청에 '가격'이 함께 있을 때(2026-09-20 재현): '실제 BTC "
+        "가격으로 시뮬레이션 부탁해'처럼 '가격'이라는 단어가 있어도, 이건 지금 시세를 묻는 게 "
+        "아니라 백테스트에 쓸 참고 데이터 종류(과거 실제 가격 vs 가정 시나리오)를 말하는 것입니다 "
+        "— 이 경우 run_backtest는 plan_agent가 처리하니, 당신은 '지금 시세가 궁금하면 말씀해 "
+        "주세요' 정도로 아주 짧게만 답하고, plan_agent가 무엇을 할지 대신 설명하거나 필요한 "
+        "정보를 다시 요구하지 마세요 — 그건 당신 몫이 아닙니다."
     ),
     "plan_agent": (
         "당신은 이번 달 예산·전략 계획 담당 Agent입니다. get_month_status로 현재 상태를 확인하고, "
@@ -818,7 +824,16 @@ _AGENT_SYSTEM_PROMPTS = {
         "이면 전략별로 어떻게 나눠 매수되는지 등을 실제로 설명하세요, "
         "(3) 이 서비스는 BTC 전용 예산만 관리합니다 — 사용자가 BTC가 아닌 다른 자산(이더리움 등)에 "
         "대한 금액을 말하면, 그 금액으로 BTC 예산 제안을 만들지 말고 '이 서비스는 BTC 예산만 "
-        "관리합니다. BTC로 설정하시겠어요?'라고 되물으세요.\n\n"
+        "관리합니다. BTC로 설정하시겠어요?'라고 되물으세요, "
+        "(4) 실사용 재현(2026-09-20): '월 예산 300만원, 기간 2년, 실제 BTC 가격으로 시뮬레이션 "
+        "부탁해'처럼 **시뮬레이션/백테스트 비교를 위해** 금액을 알려주는 문장은 그 금액으로 "
+        "run_backtest(monthly_budget_krw)를 바로 호출하세요 — set_monthly_budget을 부르면 안 "
+        "됩니다(사용자의 실제 예산이 조용히 바뀌는 것으로 오해될 수 있습니다). '시뮬레이션'/"
+        "'백테스트'/'비교해줘' 같은 단어가 금액과 함께 있으면 이 경우로 판단하세요. **단,**"
+        "run_backtest의 비교 구간은 항상 '직전 달까지 완료된 48개월'로 고정돼 있습니다 — 사용자가 "
+        "'2년'처럼 다른 기간을 요청해도 임의로 그 기간에 맞춰 계산하지 말고, 결과를 보여줄 때 "
+        "'이 서비스의 시뮬레이션은 항상 48개월 고정 구간입니다'라고 명확히 안내하세요(요청한 "
+        "기간을 조용히 무시하지 마세요).\n\n"
         "중요 — 예산 제안 응답에서는 금액·적용월·저장 여부·확인/취소 방법을 당신이 직접 서술하지 "
         "마세요(2026-09-19 수정: 이전엔 '반드시 포함하라'였는데, 그러면 시스템이 덧붙이는 안내와 "
         "내용이 겹치거나 서로 다른 표현이 되어 모순처럼 보일 위험이 있었습니다) — set_monthly_budget "
@@ -1199,6 +1214,29 @@ def _maybe_force_buy_execution_request(question: str, agents: list[str], approva
         return None
     executed_date = datetime.now(KST).strftime("%Y-%m-%d")
     return {"amount_krw": amount, "executed_date": executed_date}
+
+
+# 실사용 재현(2026-09-20, #8): "300만원으로 4년동안 전략별 시뮬레이션 부탁해"에서 plan_agent가
+# run_backtest 대신 set_monthly_budget을 호출해 예산 변경 제안 카드가 떴다 — 프롬프트에 "시뮬레이션
+# 요청이면 run_backtest를 호출하라"는 지시를 추가했는데도(§29) 다른 문구로 재현됐다. 프롬프트
+# 준수에만 기대지 않고, 서버가 직접 감지해 고친다: 이번 턴에 예산 변경 제안이 실제로 생겼는데
+# 질문에 시뮬레이션 의도 단어가 있으면, 그 제안을 조용히 취소하고 같은 금액으로 직접
+# run_backtest를 호출해 결과로 대체한다 — 사용자가 실수로 만들어진 예산 변경 제안을 볼 일이
+# 없어진다(취소를 눌러야 하는 성가심조차 없앤다).
+_SIMULATION_INTENT_WORDS = (
+    "시뮬레이션", "백테스트", "비교해줘", "비교해줄래", "전략별", "전략들을 비교", "전략 비교",
+)
+
+
+def _maybe_replace_budget_proposal_with_backtest(question: str, budget_proposal: dict | None) -> dict | None:
+    """이번 턴에 실수로 만들어진 예산 변경 제안(budget_proposal)이 있고, 질문에 시뮬레이션 의도가
+    있으면 그 제안 내용(취소용 토큰·금액)을 반환한다 — 호출부가 이 토큰으로 제안을 취소하고
+    run_backtest로 대체한다. 그 외에는 None(진짜 예산 변경 의도일 수 있으니 손대지 않는다)."""
+    if budget_proposal is None:
+        return None
+    if not any(w in question for w in _SIMULATION_INTENT_WORDS):
+        return None
+    return budget_proposal
 
 
 # 실사용 신고(2026-09-20, #2): "10월 예산은 얼마야?"에서 "얼마"가 무조건 price_agent를 끌어들여,
@@ -1819,6 +1857,18 @@ def build_supervisor(llm=None):
                 "(BTC) 중 하나를 알려주세요. 참고로 이 기록은 실제 거래소 주문이 아닌 장부 기록이며, "
                 "승인 절차를 거칩니다."
             )
+
+        stray_budget_proposal = _maybe_replace_budget_proposal_with_backtest(safe_question, _LAST_BUDGET_PROPOSAL)
+        if stray_budget_proposal is not None:
+            cancel_result = month_state.cancel_budget_change(stray_budget_proposal["confirmation_token"])
+            backtest_text = run_backtest.invoke({"monthly_budget_krw": stray_budget_proposal["amount_krw"]})
+            trace.append({
+                "step": "replace_budget_proposal_with_backtest",
+                "input": {"amount_krw": stray_budget_proposal["amount_krw"], "cancelled": cancel_result.get("ok")},
+                "output": "시뮬레이션 의도 감지 — 예산 변경 제안을 취소하고 run_backtest로 대체",
+            })
+            _LAST_BUDGET_PROPOSAL = None
+            answers_by_agent["plan_agent"] = backtest_text
 
         # 실시간 상태 답(price/plan/ledger_agent)을 항상 일반 개념 설명(research_agent)보다 앞에
         # 배치한다 — 사용자 상태 정보와 일반 설명의 역할을 답변 순서에서도 구분해, 상태 답이 먼저

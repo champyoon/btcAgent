@@ -83,7 +83,7 @@ curl -X POST http://localhost:8000/approve -H "Content-Type: application/json" \
 curl -X POST http://localhost:8000/reject -H "Content-Type: application/json" \
   -d '{"approval_id": "..."}'
 
-# Deterministic calculation tests (no AWS needed, no LLM calls) — 251/251 as of 2026-09-20
+# Deterministic calculation tests (no AWS needed, no LLM calls) — 254/254 as of 2026-09-20
 # UI-interaction tests (separate category, not counted above) — ui/tests/: 34/34 as of 2026-09-20
 python -m pytest tests/ -v
 
@@ -1243,6 +1243,77 @@ Key invariants to preserve when touching this code:
   (3 phrasings) and live (Haiku 4.5, `global.` profile, state seeded to match the screenshot — budget
   1,000,000원, RSI selected, one 500,000원 buy approved): "매수 이력 보여줘" now returns the correct
   record table via `ledger_agent`.
+- **A "run a backtest simulation with this budget" request can be mistaken by `plan_agent` for a real
+  "set this as my budget" instruction, because both ultimately turn on "amount + decision-sounding
+  language"** (found via a real screenshot, 2026-09-20). "월 예산: 300만원 기간: 2년 실제 BTC
+  가격으로 시뮬레이션 부탁해" — a clear reply to the bot's own prior request for simulation
+  parameters — produced a `budget_change_needs_confirmation` card instead of running
+  `run_backtest(3000000)`. Routing was never the problem here (`run_backtest` and `set_monthly_budget`
+  are both `plan_agent` tools, so the question always reached the right agent) — this was purely a tool-
+  *choice* mistake by the model, the same shape as the three existing prompt-level exclusions for
+  `set_monthly_budget` (calculation-only question / example-explanation / non-BTC asset), just a fourth
+  case those didn't cover: an amount stated specifically **for a simulation/backtest comparison**. Added
+  a fourth exclusion telling the model to call `run_backtest` directly whenever "시뮬레이션"/"백테스트"/
+  "비교해줘" appears together with an amount, and explicitly not to call `set_monthly_budget` for it
+  (since that would read as silently changing the user's real budget). Also addressed a **second, separate
+  issue in the same exclusion**: `run_backtest`'s comparison window is hardcoded to the last 48 completed
+  calendar months (SPEC §6's fixed policy) — a user-requested period like "2년" is never actually
+  honored, and the fix explicitly tells the model to say so out loud ("이 서비스의 시뮬레이션은 항상
+  48개월 고정 구간입니다") rather than silently substituting 48 months without mentioning the mismatch,
+  the same "state the substitution, don't hide it" principle used for the budget-effective-month mismatch
+  case elsewhere in this file. **Lower severity than most fixes in this file, addressed the same way
+  anyway**: even if the model ignores this instruction, `set_monthly_budget`'s own propose→confirm gate
+  (§4-2) means nothing is actually persisted without an explicit `/confirm_budget_change` — worst case is
+  a confusing card the user can just cancel, not a silent budget change, so a heavier structural
+  safeguard wasn't judged necessary here (contrast with the buy-report `awaiting_input` case, where a
+  similar prompt failure left no way to recover the conversation at all). A **third, smaller issue**
+  surfaced live during verification of the fix above (not from the original report): with the fix in
+  place, the correct `run_backtest` table now appears from `plan_agent`, but `price_agent` also matched
+  (via the bare word "가격" in "실제 BTC 가격으로") and initially narrated what `plan_agent` was about to
+  do at some length — same "chiming in on the other agent's already-covered part" shape as the earlier
+  §24 fix, just triggered by "가격" meaning "historical reference data" here, not a live-price question at
+  all. Added a short paragraph telling `price_agent` to respond in one short line (offering to answer a
+  *live* price question if that's actually wanted) rather than describing `plan_agent`'s job for it.
+  Verified live (Haiku 4.5, `global.` profile, isolated `BTC_AGENT_DATA_DIR`): the exact reported question
+  now returns `budget_change_needs_confirmation: None` and a real three-strategy `run_backtest` table
+  (decline-day, biweekly, and RSI all compared) with the 48-month-fixed-window caveat stated explicitly;
+  `price_agent`'s accompanying text shrank from a multi-sentence description of `plan_agent`'s task to a
+  one-line acknowledgment plus a live-price offer. No dedicated unit test — this is pure prompt guidance
+  for a tool-choice decision, the same as the three existing `set_monthly_budget` exclusions, none of
+  which have one either.
+- **Superseded same day (2026-09-20, #8): the prompt-only fourth exclusion above wasn't enough — a
+  different phrasing of the exact same intent reproduced the identical bug, proving this needed a
+  structural fallback, not another prompt tweak.** "300만원으로 4년동안 전략별 시뮬레이션 부탁해"
+  (a direct reply to the bot's own request for simulation parameters, same as before) again produced a
+  real `budget_change_needs_confirmation` card instead of a backtest table, even with the exclusion
+  paragraph already in place — the model simply chose `set_monthly_budget` again for a variant sentence
+  the exclusion's example phrasing didn't closely match. This time, rather than widening the prompt
+  wording again (the same whack-a-mole this file already flags as a known limitation for this class of
+  fix), a server-side correction was added: `_maybe_replace_budget_proposal_with_backtest(question,
+  budget_proposal)` checks, *after* the worker graph has already run, whether this turn produced a real
+  `_LAST_BUDGET_PROPOSAL` **and** the question contains a simulation-intent word
+  (`_SIMULATION_INTENT_WORDS`: 시뮬레이션/백테스트/비교해줘/비교해줄래/전략별/전략 비교) — if both are
+  true, `run()` calls `month_state.cancel_budget_change()` on the stray proposal's own token (not just
+  hiding it from the response — the token is actually consumed so a later confirm attempt can't slip
+  through) and replaces `answers_by_agent["plan_agent"]` with a direct `run_backtest.invoke(...)` call
+  using the same amount the model had already extracted correctly (the model got the *number* right, "3
+  million," every time — it only ever picked the wrong *tool*, so reusing its parsed amount for the
+  correction is safe). This runs regardless of which exact sentence triggered the mistake, closing the
+  whole class of phrasing rather than one more example. A genuine budget-setting message with no
+  simulation words is untouched — the check requires an *actual* stray proposal to already exist, so it
+  can never fire on a message that never went down the wrong path. Verified with a fake LLM that
+  reproduces the real failure exactly (always calls `set_monthly_budget` when bound to `plan_agent`'s
+  tools, mirroring the actual model's tool-choice mistake) in
+  `tests/test_simulation_vs_budget_change.py` (3 tests, price-history cache pre-seeded to already be
+  "fresh" per §7-1 so `run_backtest` never needs real network I/O): the stray proposal never reaches the
+  response and the real three-strategy backtest table appears instead; `agent._LAST_BUDGET_PROPOSAL` is
+  confirmed `None` afterward (proving the token was actually cancelled, not just hidden); a genuine
+  budget-setting message with no simulation words still produces a normal, untouched
+  `budget_change_needs_confirmation`. **Not re-verified live this round** — two consecutive Bedrock
+  rate-limit errors were hit during the attempt and, per this session's standing rule against repeated
+  retries, the live check was deferred rather than hammered; the fake-LLM test reproduces the exact
+  real failure mode directly (unlike a prompt-only fix, this one's correctness doesn't depend on what
+  the model happens to do), so it stands as the primary evidence until a live re-check is convenient.
 
 ## How this was verified
 
@@ -1396,6 +1467,15 @@ still routes to `price_agent` alone (routing fix didn't over-reach); "비트코�
 which surfaced the separate relevance-gate bug live, not by inspection — was re-run after the
 `retriever.py` fix and the server restart, and now also returns the full grounded explanation instead of
 the false "not in our docs" claim. No repeated retries were needed.
+
+**Full live verification of the simulation-vs-budget-change fix (2026-09-20, Haiku 4.5, `global.`
+profile, isolated `BTC_AGENT_DATA_DIR`)**: the exact reported reply ("월 예산: 300만원 기간: 2년 실제
+BTC 가격으로 시뮬레이션 부탁해") now returns `budget_change_needs_confirmation: None` and a genuine
+`run_backtest` three-strategy comparison table, with the 48-month-fixed-window caveat stated explicitly
+instead of silently substituting for the requested "2년." Also confirmed the `price_agent`-chiming-in
+follow-up fix: after the prompt tweak and a server restart, `price_agent`'s accompanying text is one
+short line instead of a multi-sentence description of what `plan_agent` would do. No repeated retries
+were needed.
 
 **Still open / needs a decision**: `evaluation/run_ragas.py` doesn't currently run in this environment
 (ragas 0.3.0 vs. Python 3.14 asyncio incompatibility, not an app bug) — see Commands above and
